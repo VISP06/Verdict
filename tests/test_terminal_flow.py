@@ -279,3 +279,118 @@ def test_situation_shows_actual_30_and_90_day_outflows():
     situation = session.assistant.situation()
     assert f"outflows next 30 days: INR {situation['committed_outflows_next_30_days']:,.2f}" in text
     assert f"next 90 days: INR {situation['committed_outflows_next_90_days']:,.2f}" in text
+
+
+def test_reported_phase_fresh_refrigerator_request():
+    session = TerminalSession("user_07", "2025-11-04")
+    session.handle("Laptop 12k no deadline just advise")
+    assert session.phase == "reported"
+
+    blocks = session.handle(
+        "Can I buy a Refrigerator worth 50k INR by the end of next month? "
+        "I will pay in full without any installments"
+    )
+    assert "I didn't understand that" not in blocks[0]["text"]
+    assert any(b["kind"] == "report" for b in blocks)
+    assert session.form["item"] == "refrigerator"
+    assert session.form["amount"] == 50000.0
+    assert session.form["currency"] == "INR"
+    assert session.form["pay_by_date"] == "2025-12-31"  # end of next month relative to 2025-11-04
+    assert session.form["allow_partial"] is False
+    assert session.form["allow_installments"] is False
+
+    # Second fresh request in reported phase
+    blocks2 = session.handle("Bike 25k no deadline just advise")
+    assert any(b["kind"] == "report" for b in blocks2)
+    assert session.form["item"] == "bike"
+    assert session.form["amount"] == 25000.0
+
+
+def test_reported_phase_direct_account_questions():
+    session = TerminalSession("user_07", "2025-11-04")
+    session.handle("Laptop 12k no deadline just advise")
+    assert session.phase == "reported"
+    from money import money
+    situation = session.assistant.situation()
+    currency = session.assistant.engine.get_user_home_currency("user_07")
+    expected_balance = money(situation["current_balance"], currency)
+    capacity = max(0.0, situation["lowest_projected_balance"] - situation["minimum_balance"])
+    expected_max = money(capacity, currency)
+
+    # 1. Bank balance question only
+    blocks = session.handle("What is my current bank balance?")
+    assert len(blocks) == 1
+    assert "I didn't understand that" not in blocks[0]["text"]
+    assert expected_balance in blocks[0]["text"]
+
+    # 2. Most expensive affordable question only
+    blocks = session.handle("What is the most expensive thing I can afford right now?")
+    assert len(blocks) == 1
+    assert "I didn't understand that" not in blocks[0]["text"]
+    assert expected_max in blocks[0]["text"]
+    assert "lowest projected balance" in blocks[0]["text"]
+
+    # 3. Combined question
+    blocks = session.handle("what is my current bank balance? what is the most expensive thing I can afford right now")
+    assert len(blocks) == 1
+    assert "I didn't understand that" not in blocks[0]["text"]
+    assert expected_balance in blocks[0]["text"]
+    assert expected_max in blocks[0]["text"]
+
+
+def test_existing_report_followups_continue_working():
+    session = TerminalSession("user_07", "2025-11-04")
+    session.handle("Laptop 12k no deadline just advise")
+    assert session.phase == "reported"
+
+    # why not now
+    why_blocks = session.handle("why not now")
+    assert any("balance" in b["text"].lower() or "minimum" in b["text"].lower() for b in why_blocks)
+
+    # /why
+    why_cmd_blocks = session.handle("/why")
+    assert any("Data loaded:" in b["text"] for b in why_cmd_blocks)
+
+    # pay half now
+    half_blocks = session.handle("pay half now")
+    assert any(b["text"].startswith("WHAT CHANGED") for b in half_blocks)
+    assert any(b["kind"] == "report" for b in half_blocks)
+
+    # wait a month
+    wait_blocks = session.handle("wait a month")
+    assert any(b["text"].startswith("WHAT CHANGED") for b in wait_blocks)
+    assert any(b["kind"] == "report" for b in wait_blocks)
+
+    # 6 installments
+    inst_blocks = session.handle("6 installments")
+    assert any(b["text"].startswith("WHAT CHANGED") for b in inst_blocks)
+    assert any(b["kind"] == "report" for b in inst_blocks)
+
+    # actually 20k
+    act_blocks = session.handle("actually 20k")
+    assert any(b["text"].startswith("WHAT CHANGED") for b in act_blocks)
+    assert any(b["kind"] == "report" for b in act_blocks)
+    assert session.form["amount"] == 20000.0
+
+
+def test_pay_in_full_today_no_useless_alternatives_and_no_duplicate_options():
+    session = TerminalSession("user_07", "2025-11-04")
+    blocks = session.handle("Laptop 12k no deadline just advise")
+    report_text = blocks[0]["text"]
+    assert "PAY IN FULL TODAY" in report_text
+
+    alts_section = report_text.split("ALTERNATIVES\n", 1)[1].split("\n\nNEXT STEPS\n")[0]
+    next_steps_section = report_text.split("NEXT STEPS\n", 1)[1]
+
+    # No meaningless lines
+    assert "Best other safe option: none" not in alts_section
+    assert "Best other safe options: none" not in alts_section
+    assert f"Earliest safe date to wait for: {session.as_of_date}" not in alts_section
+    assert "Spending changes that would free cash: none" not in alts_section
+
+    # Alternatives do not duplicate the selected option
+    assert "Earliest safe date to wait for:" not in alts_section
+
+    # Tailored next steps
+    assert "Confirm the selected plan" in next_steps_section
+    assert "Do not make this payment now" not in next_steps_section

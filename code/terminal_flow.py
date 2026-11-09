@@ -219,7 +219,7 @@ class TerminalSession:
         self.request_text = line
         home = str(self.assistant.engine.get_user_home_currency(self.user_id))
         self.form = {"amount": amount, "currency": currency or home,
-                     "item": re.sub(r"\b(?:can i afford|should i buy|buy|costs?)\b", "", line, flags=re.I).strip(" ?.!$") or "payment",
+                     "item": self._request_item(line),
                      "allow_partial": False, "allow_installments": False,
                      "installment_count": 3, "installment_fee_pct": 0.0}
         lowered = line.lower()
@@ -230,7 +230,7 @@ class TerminalSession:
             self.form["allow_partial"] = True
             if "pay half now" in lowered:
                 self.form["partial_amount"] = amount * 0.5
-        elif not re.search(r"\b(no partial|pay in full|full payment only)\b", lowered):
+        elif not re.search(r"\b(no partial|pay in full|full payment only|in full)\b", lowered):
             self.questions.append("partial")
         count = re.search(r"\b(\d+)\s+installments?\b", lowered)
         if count:
@@ -242,8 +242,8 @@ class TerminalSession:
                 else: self.questions.append("fee")
             else:
                 self.questions.append("fee")
-        elif "installment" not in lowered:
-            self.questions.append("installments")
+        elif re.search(r"\b(?:no installments?|without (?:any )?installments?|without installments?)\b", lowered):
+            self.form["allow_installments"] = False
         else:
             self.questions.append("installments")
         if self.form.get("allow_installments") and self.form.get("pay_by_date") and self._has_installment_conflict(self.form["pay_by_date"]):
@@ -264,6 +264,28 @@ class TerminalSession:
             prompt_block = self._prompt()
             return self.last_blocks
         return self._make_report()
+
+    @staticmethod
+    def _request_item(text):
+        """Extract the purchase name from common amount-and-deadline phrasing."""
+        value = str(text or "").strip()
+        match = re.search(
+            r"\b(?:buy|purchase)\s+(?:a|an|the)?\s*(.+?)\s+"
+            r"(?:worth|costing|costs?|priced at)\s+(?:₹|\$|€|R\s*)?"
+            r"[\d,.]+\s*(?:k|thousand|lakh|lakhs|lac|lacs|crore|crores)?",
+            value, re.I,
+        )
+        if match:
+            item = match.group(1)
+        else:
+            item = re.sub(r"\b(?:can i|can we|should i|should we)\b", "", value, flags=re.I)
+            item = re.sub(r"\b(?:buy|purchase|afford)\b", "", item, flags=re.I)
+            item = re.split(r"\b(?:worth|costing|costs?|by|i will|i'll|without|no installments?)\b", item, maxsplit=1, flags=re.I)[0]
+            item = re.sub(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|Rs\.?)\b)\s*", "", item, flags=re.I)
+            item = re.sub(r"\b\d[\d,.]*(?:\s*(?:k|thousand|lakh|lakhs|lac|lacs|crore|crores))?\b", "", item, flags=re.I)
+            item = re.sub(r"\b(?:no deadline|no due date|just advise|in full|pay in full|pay half now)\b", "", item, flags=re.I)
+        item = re.sub(r"\b(?:a|an|the)\b", "", item, flags=re.I)
+        return re.sub(r"\s+", " ", item).strip(" ?.!,$") .lower() or "payment"
 
     def _parse_deadline(self, text):
         if re.search(r"\b(no deadline|no due date|just advise)\b", text, re.I):
@@ -291,6 +313,12 @@ class TerminalSession:
             day = dt.date.fromisoformat(self.as_of_date)
             next_month = day.replace(day=28) + dt.timedelta(days=4)
             self.form["pay_by_date"] = (next_month.replace(day=1) - dt.timedelta(days=1)).isoformat()
+            return True
+        if re.search(r"\b(?:end of next month|by the end of next month)\b", text, re.I):
+            day = dt.date.fromisoformat(self.as_of_date)
+            first_next = (day.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+            first_following = (first_next.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+            self.form["pay_by_date"] = (first_following - dt.timedelta(days=1)).isoformat()
             return True
         return False
 
@@ -432,26 +460,89 @@ class TerminalSession:
             rows.append(f"{option['type'].replace('_',' '):22} {', '.join(option['dates']):20} {money(option['total_cost'],currency):16} {money(option['lowest_projected_balance'],currency):16} {meets}   {safe_mark} {'SAFE' if option.get('safe') else 'UNSAFE'}")
             if not option.get("safe"):
                 rows.append(f"                         Note: {safety}")
-        other_safe = [x["type"].replace("_", " ") for x in options if x.get("safe") and x is not chosen]
-        alts = [f"Best other safe options: {', '.join(other_safe) or 'none'}.",
-                f"Earliest safe date to wait for: {situation.get('earliest_date_for_full_payment') or 'not available'}.",
-                f"Amount safe to pay today: {money(result['decision'].get('amount_safe_to_pay', 0),currency)}.",
-                f"Spending changes that would free cash: {result['decision'].get('spending_changes_needed', 'none')}."]
+        other_safe_items = [x for x in options if x.get("safe") and x is not chosen]
+        other_safe_names = [x["type"].replace("_", " ") for x in other_safe_items]
+        earliest = situation.get("earliest_date_for_full_payment")
+        safe_today = float(result["decision"].get("amount_safe_to_pay", 0) or 0)
+        spending_changes = result["decision"].get("spending_changes_needed", "none")
+        alts = []
+
+        if verdict.startswith("PAY IN FULL TODAY"):
+            if other_safe_names:
+                alts.append(f"Other safe payment structures: {', '.join(other_safe_names)}.")
+            else:
+                alts.append("Paying in full today is your most direct and cost-effective safe option.")
+            buffer = situation["lowest_projected_balance"] - minimum
+            alts.append(
+                f"Projected lowest balance stays {money(buffer, currency)} above your required minimum "
+                f"on {situation['lowest_projected_date']}."
+            )
+        elif verdict.startswith("NOT RECOMMENDED"):
+            if safe_today > 0:
+                alts.append(f"Amount safe to pay today: {money(safe_today, currency)} (downsized purchase).")
+            if earliest and earliest > self.as_of_date:
+                alts.append(f"Earliest safe date to wait for: {earliest}.")
+            if other_safe_names:
+                alts.append(f"Safe alternative options: {', '.join(other_safe_names)}.")
+            if spending_changes != "none":
+                alts.append(f"Spending changes that would free cash: {spending_changes}.")
+            if not alts:
+                alts.append("No safe alternative within the 90-day forecast. Consider reducing the amount or deferring.")
+        elif "WAIT" in verdict:
+            if safe_today > 0:
+                alts.append(f"Amount safe to pay today: {money(safe_today, currency)} (partial payment).")
+            if other_safe_names:
+                alts.append(f"Other safe options: {', '.join(other_safe_names)}.")
+            if spending_changes != "none":
+                alts.append(f"Spending changes to enable paying sooner: {spending_changes}.")
+            if not alts:
+                alts.append(f"Waiting until {earliest} avoids dropping below your required minimum balance.")
+        else:
+            if earliest and earliest > self.as_of_date:
+                alts.append(f"Full payment alternative: wait until {earliest} to pay in full and avoid fees.")
+            if other_safe_names:
+                alts.append(f"Other safe options: {', '.join(other_safe_names)}.")
+            if spending_changes != "none":
+                alts.append(f"Spending changes that would free cash: {spending_changes}.")
+            if not alts:
+                alts.append("The selected plan is the earliest way to proceed safely without overdraft risk.")
+
         if verdict.startswith("NOT RECOMMENDED"):
             steps = ["Do not make this payment now"]
-            safe_today = float(result["decision"].get("amount_safe_to_pay", 0) or 0)
             if safe_today > 0:
                 steps.append(f"Amount safe to pay today: {money(safe_today, currency)}.")
-            earliest = situation.get("earliest_date_for_full_payment")
             if earliest:
                 steps.append(f"Earliest safe date: {earliest}.")
-            spending_changes = result["decision"].get("spending_changes_needed", "none")
             steps.append(
                 "This answer could change if income resumes, you choose a smaller amount, "
                 f"or spending changes ({spending_changes})."
             )
+        elif verdict.startswith("PAY IN FULL TODAY"):
+            steps = [
+                f"Confirm the selected plan for {money(self.form['amount'], currency)}.",
+                f"Keep the minimum balance of {money(minimum, currency)} available in your account.",
+                "Recheck the forecast before making the payment if unexpected expenses occur.",
+            ]
+        elif "WAIT" in verdict:
+            chosen_date = max(chosen["dates"]) if chosen and chosen.get("dates") else (earliest or "the safe date")
+            steps = [
+                f"Hold the payment until {chosen_date}; do not pay in full today.",
+                f"Ensure minimum balance of {money(minimum, currency)} remains protected.",
+                "Recheck your balance before the safe date to ensure expected income arrived.",
+            ]
+        elif "INSTALLMENTS" in verdict:
+            count = self.form.get("installment_count", 3)
+            steps = [
+                f"Confirm the {count}-installment plan for {money(self.form['amount'], currency)}.",
+                f"Ensure sufficient funds on each monthly due date while maintaining {money(minimum, currency)}.",
+                "Recheck the forecast before making each scheduled payment.",
+            ]
         else:
-            steps = [f"Confirm the selected plan for {money(self.form['amount'],currency)}.", "Keep the minimum balance available.", "Recheck the forecast before making the payment."]
+            steps = [
+                f"Confirm the selected plan for {money(self.form['amount'], currency)}.",
+                f"Keep the minimum balance of {money(minimum, currency)} available.",
+                "Recheck the forecast before making the payment.",
+            ]
         dates = list(balances)
         start_date = dates[0] if dates else self.as_of_date
         end_date = dates[-1] if dates else (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
@@ -495,6 +586,63 @@ class TerminalSession:
                             "start_balance": values[0] if values else situation["current_balance"],
                             "end_balance": values[-1] if values else situation["current_balance"]},
                 "options": options, "alternatives": alternatives, "next_steps": next_steps}
+
+    def _handle_account_inquiry(self, text):
+        low = text.lower()
+        is_balance = bool(re.search(
+            r"\b(?:bank\s+)?balance\b|\bhow\s+much\s+(?:do\s+i\s+have|money\s+(?:do\s+i\s+have|in\s+(?:my\s+)?account))\b",
+            low,
+        ))
+        is_afford = bool(re.search(
+            r"\b(?:most\s+expensive(?:\s+thing)?|how\s+much\s+can\s+i\s+(?:afford|spend)|what\s+(?:is\s+the\s+most\s+expensive\s+thing\s+)?(?:i\s+can\s+afford|can\s+i\s+afford)|afford\s+right\s+now|maximum\s+(?:purchase|amount|payment))\b",
+            low,
+        ))
+        if not (is_balance or is_afford):
+            return None
+        situation = self.assistant.situation()
+        currency = str(self.assistant.engine.get_user_home_currency(self.user_id))
+        curr_bal = situation["current_balance"]
+        min_bal = situation["minimum_balance"]
+        low_bal = situation["lowest_projected_balance"]
+        low_date = situation["lowest_projected_date"]
+        capacity = max(0.0, low_bal - min_bal)
+        if is_balance and is_afford:
+            resp = (
+                f"Your current available balance is {money(curr_bal, currency)}. "
+                f"The most expensive payment you can safely afford right now is {money(capacity, currency)}. "
+                f"Over the next 90 days, your lowest projected balance is {money(low_bal, currency)} on {low_date}, "
+                f"keeping you at or above your required minimum balance of {money(min_bal, currency)}."
+            )
+        elif is_balance:
+            resp = (
+                f"Your current available balance is {money(curr_bal, currency)} "
+                f"(minimum balance requirement: {money(min_bal, currency)})."
+            )
+        else:
+            resp = (
+                f"The most expensive payment you can safely afford right now is {money(capacity, currency)}. "
+                f"Over the next 90 days, your lowest projected balance is {money(low_bal, currency)} on {low_date}, "
+                f"leaving a safe margin above your required minimum balance of {money(min_bal, currency)}."
+            )
+        self._block("text", resp)
+        return self.last_blocks
+
+    def _is_new_request_in_reported_phase(self, text):
+        amount, _ = parse_amount(text)
+        if amount is None:
+            return False
+        low = text.lower().strip()
+        if re.search(r"\b(actually|make it)\b", low):
+            return False
+        if re.search(r"\bpay\s+(?:\d+(?:\.\d+)?%|[\d,.]+(?:\s*(?:k|thousand))?)\s+now\b", low):
+            return False
+        if re.match(r"^(?:wait\b|a month later|half now|pay half now)", low):
+            return False
+        if re.fullmatch(r"(?:3|6|12)\s+installments?", low):
+            return False
+        if re.fullmatch(r"by\s+20\d\d-\d\d-\d\d", low):
+            return False
+        return True
 
     def handle(self, line):
         self.last_blocks = []
@@ -577,6 +725,16 @@ class TerminalSession:
                 report_text = self.render_report(self.report)
                 why = report_text.split("WHY\n", 1)[-1].split("\n\nNUMBERS", 1)[0]
                 self._block("text", why)
+            elif (account_inquiry := self._handle_account_inquiry(text)) is not None:
+                return account_inquiry
+            elif self._is_new_request_in_reported_phase(text):
+                self.phase = "ready"
+                self.form = {}
+                self.questions = []
+                self.question_index = 0
+                self.invalid_attempts = 0
+                self.report = None
+                return self._start(text)
             else:
                 previous = self._comparison(self.report) if self.report else None
                 changed = self._apply_followup(text)

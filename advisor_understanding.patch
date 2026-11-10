@@ -1,0 +1,920 @@
+diff --git a/app.py b/app.py
+index 912754ad..55c4c29e 100644
+--- a/app.py
++++ b/app.py
+@@ -56,8 +56,13 @@ def report_html(block):
+                   f" → {numbers.get('end_date', '')} · {money(numbers.get('end_balance', 0), currency)}")
+     pieces = [f'<div class="report status-{esc(status)}" style="--status:{color}">',
+               f'<div class="verdict">{esc(data.get("verdict", "Report"))}</div>']
+-    for title, key in (("WHY", "why"),):
+-        pieces += [f'<div class="section-title">{title}</div><p>{esc(data.get(key, ""))}</p>']
++    if data.get("understood"):
++        pieces.append(f'<div class="range">UNDERSTOOD AS · {esc(data["understood"])}</div>')
++    pieces += [f'<div class="section-title">WHY</div><p>{esc(data.get("why", ""))}</p>']
++    for title, key in (("HEADROOM", "headroom"), ("AHEAD", "ahead")):
++        if data.get(key):
++            pieces.append(f'<div class="section-title">{title}</div>')
++            pieces.extend(f'<p>• {esc(line.lstrip("• "))}</p>' for line in data[key])
+     pieces += [f'<div class="section-title">NUMBERS</div><div class="spark">{esc(spark)}</div>',
+                f'<p>Minimum balance: {esc(money(numbers.get("minimum", 0), currency))}</p>',
+                f'<div class="range">{esc(range_text)}</div>', '<div class="section-title">OPTIONS</div>',
+diff --git a/code/insights.py b/code/insights.py
+new file mode 100644
+index 00000000..8b16ad5a
+--- /dev/null
++++ b/code/insights.py
+@@ -0,0 +1,75 @@
++"""Small, model-free helpers that turn a forecast situation into things a person can act on.
++
++Every function takes the dict returned by Assistant.situation() (balances, minimum, breakdown)
++and only reads it; nothing is recomputed from raw data.
++"""
++import datetime as dt
++
++
++def safe_to_spend_today(situation):
++    """The largest single payment today that keeps the balance at or above the minimum all window long."""
++    return max(0.0, float(situation["lowest_projected_balance"]) - float(situation["minimum_balance"]))
++
++
++def capacity_from(situation, date):
++    """Largest single payment on `date` that keeps every later day at or above the minimum."""
++    balances = situation.get("balances", {})
++    later = [value for day, value in balances.items() if day >= date]
++    if not later:
++        return 0.0
++    return max(0.0, min(later) - float(situation["minimum_balance"]))
++
++
++def _flows(situation):
++    flows_by_day = (situation.get("breakdown") or {}).get("flows_by_day", {})
++    seen = set()
++    for day in sorted(flows_by_day):
++        for flow in flows_by_day[day]:
++            amount = float(flow.get("amount", 0) or 0)
++            label = str(flow.get("description") or flow.get("series_key") or flow.get("category") or "").strip()
++            key = (day, round(amount, 2), label.lower())
++            if key in seen:
++                continue
++            seen.add(key)
++            yield day, flow, amount, label
++
++
++def upcoming_income(situation, as_of=None):
++    """Counted income flows that arrive after today, soonest first."""
++    as_of = as_of or min(situation.get("balances", {"": ""}))
++    rows = []
++    for day, flow, amount, label in _flows(situation):
++        if flow.get("source") == "income" and amount > 0 and day > as_of:
++            rows.append({"date": day, "amount": amount, "label": label or "income"})
++    return rows
++
++
++def upcoming_bills(situation, days=30, limit=5, as_of=None):
++    """The largest fixed bills (recurring or scheduled) within the next `days` days."""
++    as_of = as_of or min(situation.get("balances", {"": ""}))
++    horizon = (dt.date.fromisoformat(as_of) + dt.timedelta(days=days)).isoformat()
++    rows = []
++    for day, flow, amount, label in _flows(situation):
++        if amount < 0 and flow.get("source") in {"recurring_series", "scheduled_event"} and as_of <= day <= horizon:
++            rows.append({"date": day, "amount": -amount, "label": label or str(flow.get("category") or "bill"),
++                         "category": str(flow.get("category") or "")})
++    return sorted(rows, key=lambda row: -row["amount"])[:limit]
++
++
++def everyday_spending_per_day(situation):
++    """Average projected everyday (non-fixed) spending per day; 0 when none is projected."""
++    balances = situation.get("balances", {})
++    if not balances:
++        return 0.0
++    total = 0.0
++    for _, flow, amount, _ in _flows(situation):
++        if amount < 0 and flow.get("source") not in {"recurring_series", "scheduled_event"}:
++            total += -amount
++    return total / max(1, len(balances))
++
++
++def cushion_label(cushion_after, minimum):
++    """'comfortable', 'tight' or 'unsafe' from the margin left above the minimum balance."""
++    if cushion_after < 0:
++        return "unsafe"
++    return "comfortable" if cushion_after >= 0.15 * max(1.0, float(minimum)) else "tight"
+diff --git a/code/request_parser.py b/code/request_parser.py
+new file mode 100644
+index 00000000..7b435f47
+--- /dev/null
++++ b/code/request_parser.py
+@@ -0,0 +1,241 @@
++"""Deterministic parsing of one free-text request into the pieces the advisor needs.
++
++A sentence such as "Can I buy a refrigerator worth 50k INR by the end of next month?
++I will pay in full without any installments" is cut into an item, a deadline and a
++payment style. Each piece is optional: anything not found is returned as None so the
++caller can ask for it. Nothing here calls a model.
++"""
++import calendar
++import datetime as dt
++import re
++
++MONTHS = {name: index for index, names in enumerate(
++    [("january", "jan"), ("february", "feb"), ("march", "mar"), ("april", "apr"), ("may",),
++     ("june", "jun"), ("july", "jul"), ("august", "aug"), ("september", "sep", "sept"),
++     ("october", "oct"), ("november", "nov"), ("december", "dec")], start=1) for name in names}
++WEEKDAYS = {"monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2, "wed": 2,
++            "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "friday": 4, "fri": 4,
++            "saturday": 5, "sat": 5, "sunday": 6, "sun": 6}
++NUMBER_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
++                "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "eighteen": 18,
++                "twenty": 20, "twenty-four": 24, "thirty": 30}
++_NUM = r"(\d+|" + "|".join(sorted(NUMBER_WORDS, key=len, reverse=True)) + r")"
++_MONTH = r"(" + "|".join(sorted(MONTHS, key=len, reverse=True)) + r")"
++_WEEKDAY = r"(" + "|".join(sorted(WEEKDAYS, key=len, reverse=True)) + r")"
++
++
++def _number(token):
++    token = token.lower()
++    return int(token) if token.isdigit() else NUMBER_WORDS[token]
++
++
++def end_of_month(day):
++    return day.replace(day=calendar.monthrange(day.year, day.month)[1])
++
++
++def add_months(day, months):
++    index = day.month - 1 + months
++    year, month = day.year + index // 12, index % 12 + 1
++    return dt.date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
++
++
++def _next_day_of_month(as_of, day_number):
++    """The next date (today or later) that falls on the given day of the month."""
++    for offset in range(0, 14):
++        year_month = add_months(as_of.replace(day=1), offset)
++        if day_number <= calendar.monthrange(year_month.year, year_month.month)[1]:
++            candidate = year_month.replace(day=day_number)
++            if candidate >= as_of:
++                return candidate
++    return None
++
++
++def _month_day(as_of, month, day_number, year=None):
++    try:
++        if year is not None:
++            return dt.date(year if year > 99 else 2000 + year, month, day_number)
++        candidate = dt.date(as_of.year, month, day_number)
++        return candidate if candidate >= as_of else dt.date(as_of.year + 1, month, day_number)
++    except ValueError:
++        return None
++
++
++def parse_deadline_phrase(text, as_of, day_first=True):
++    """Return {"date", "no_deadline", "past", "span"}; date is None when nothing usable is found."""
++    if isinstance(as_of, str):
++        as_of = dt.date.fromisoformat(as_of)
++    low = str(text or "").lower()
++    result = {"date": None, "no_deadline": False, "past": False, "span": None}
++
++    def found(date, match):
++        if date is None:
++            return None
++        if date < as_of:
++            result.update(past=True, span=match.group(0))
++            return None
++        result.update(date=date, span=match.group(0))
++        return result
++
++    match = re.search(r"\b(no deadline|no due date|no rush|not urgent|no time ?limit|any ?time|whenever|just advise)\b", low)
++    if match:
++        result.update(no_deadline=True, span=match.group(0))
++        return result
++    match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", low)
++    if match:
++        try:
++            return found(dt.date(int(match.group(1)), int(match.group(2)), int(match.group(3))), match) or result
++        except ValueError:
++            pass
++    if (match := re.search(r"\bend of (?:the )?(?:this |current )?month\b", low)):
++        return found(end_of_month(as_of), match) or result
++    if (match := re.search(r"\bend of (?:the )?next month\b", low)):
++        return found(end_of_month(add_months(as_of, 1)), match) or result
++    if (match := re.search(r"\bend of (?:the |this )?year\b", low)):
++        return found(dt.date(as_of.year, 12, 31), match) or result
++    if (match := re.search(r"\bend of (?:the |this )?week\b", low)):
++        return found(as_of + dt.timedelta(days=(6 - as_of.weekday()) % 7), match) or result
++    if (match := re.search(r"\bend of next week\b", low)):
++        return found(as_of + dt.timedelta(days=(6 - as_of.weekday()) % 7 + 7), match) or result
++    if (match := re.search(r"\b(?:in|within|after)\s+" + _NUM + r"\s+(day|week|month|year)s?\b", low)) or \
++            (match := re.search(r"\b" + _NUM + r"\s+(day|week|month|year)s?\s+(?:from now|from today)\b", low)):
++        count, unit = _number(match.group(1)), match.group(2)
++        delta = {"day": lambda: as_of + dt.timedelta(days=count), "week": lambda: as_of + dt.timedelta(weeks=count),
++                 "month": lambda: add_months(as_of, count), "year": lambda: add_months(as_of, 12 * count)}[unit]
++        return found(delta(), match) or result
++    if (match := re.search(r"\bday after tomorrow\b", low)):
++        return found(as_of + dt.timedelta(days=2), match) or result
++    if (match := re.search(r"\btomorrow\b", low)):
++        return found(as_of + dt.timedelta(days=1), match) or result
++    if (match := re.search(r"\b(?:today|tonight)\b", low)):
++        return found(as_of, match) or result
++    if (match := re.search(r"\bnext week\b", low)):
++        return found(as_of + dt.timedelta(days=7), match) or result
++    if (match := re.search(r"\bnext month\b", low)):
++        return found(add_months(as_of, 1), match) or result
++    if (match := re.search(r"\bnext year\b", low)):
++        return found(add_months(as_of, 12), match) or result
++    if (match := re.search(r"\bthis (?:week|weekend)\b", low)):
++        return found(as_of + dt.timedelta(days=(6 - as_of.weekday()) % 7), match) or result
++    if (match := re.search(r"\bthis month\b", low)):
++        return found(end_of_month(as_of), match) or result
++    if (match := re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MONTH + r"(?:\s*,?\s*(\d{4}))?\b", low)):
++        return found(_month_day(as_of, MONTHS[match.group(2)], int(match.group(1)), int(match.group(3)) if match.group(3) else None), match) or result
++    if (match := re.search(r"\b" + _MONTH + r"\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?\b", low)):
++        return found(_month_day(as_of, MONTHS[match.group(1)], int(match.group(2)), int(match.group(3)) if match.group(3) else None), match) or result
++    if (match := re.search(r"\b(?:by|on|before|until|till)\s+the\s+(\d{1,2})(?:st|nd|rd|th)\b", low)):
++        return found(_next_day_of_month(as_of, int(match.group(1))), match) or result
++    if (match := re.search(r"\b(?:by|before|until|till|on|this|next)\s+" + _WEEKDAY + r"\b", low)):
++        target = WEEKDAYS[match.group(1)]
++        return found(as_of + dt.timedelta(days=(target - as_of.weekday()) % 7 or 7), match) or result
++    if (match := re.search(r"\b(?:by|before|until|till|in|within)\s+(?:the\s+)?(?:end of\s+)?" + _MONTH + r"\b(?!\s*\d)", low)):
++        month = MONTHS[match.group(1)]
++        year = as_of.year if month >= as_of.month else as_of.year + 1
++        return found(end_of_month(dt.date(year, month, 1)), match) or result
++    if (match := re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", low)):
++        first, second, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
++        day, month = (first, second) if (day_first or first > 12) and second <= 12 else (second, first)
++        try:
++            return found(dt.date(year if year > 99 else 2000 + year, month, day), match) or result
++        except ValueError:
++            pass
++    return result
++
++
++def parse_payment_mode(text):
++    """What the sentence says about paying in full, in parts, or in installments."""
++    low = str(text or "").lower()
++    mode = {"allow_installments": None, "installment_count": None, "allow_partial": None,
++            "partial_fraction": None, "partial_amount_text": None}
++    negated_full = re.search(r"\b(?:not|never|cannot|can't|cant|unable to|don't|dont|won't|wont)\b[^.?!]{0,25}\bin full\b", low)
++    if re.search(r"\b(pay(?:ing)? (?:it )?(?:in full|outright|upfront in full|all at once|in one go)|full payment|lump ?sum|"
++                 r"(?:in )?one (?:go|shot|payment)|all at once|outright)\b", low) and not negated_full or \
++            (re.search(r"\bin full\b", low) and not negated_full):
++        mode.update(allow_installments=False, allow_partial=False)
++    if re.search(r"\b(?:no|without(?: any)?|not (?:using|taking|doing)|don'?t want|skip|avoid)\s+(?:emis?|installments?|instalments?|financing)\b", low):
++        mode["allow_installments"] = False
++    if re.search(r"\b(?:no|without|not in) (?:partial|parts)\b", low):
++        mode["allow_partial"] = False
++    count_match = re.search(r"\b" + _NUM + r"\s*(?:monthly\s+)?(?:installments?|instalments?|emis?|payments)\b", low) or \
++        re.search(r"\b(?:over|across|spread over|in)\s+" + _NUM + r"\s+months?\b", low)
++    if mode["allow_installments"] is not False and (count_match or re.search(r"\b(?:installments?|instalments?|emis?)\b", low)):
++        mode["allow_installments"] = True
++        if count_match:
++            mode["installment_count"] = _number(count_match.group(1))
++    if mode["allow_partial"] is not False and re.search(r"\b(partial payment|part payment|pay (?:some|part)(?: of it)? now|part now|down ?payment|half now|pay half)\b", low):
++        mode["allow_partial"] = True
++        if re.search(r"\bhalf\b", low):
++            mode["partial_fraction"] = 0.5
++    percent = re.search(r"\b(\d+(?:\.\d+)?)\s*%\s*(?:now|upfront|up front|down)\b", low)
++    if percent and mode["allow_partial"] is not False:
++        mode.update(allow_partial=True, partial_fraction=float(percent.group(1)) / 100)
++    explicit = re.search(r"\b(?:pay|put down|down ?payment of)\s+((?:[₹$€]|rs\.?|inr|usd|eur|zar|idr)?\s*[\d,.]+\s*(?:k|m|lakhs?|lacs?|crores?|cr)?)\s+(?:now|upfront|up front|first|today)\b", low)
++    if explicit and mode["allow_partial"] is not False:
++        mode.update(allow_partial=True, partial_amount_text=explicit.group(1).strip())
++    return mode
++
++
++_STOP = {"can", "could", "should", "would", "i", "we", "afford", "buy", "purchase", "get", "order", "book", "a", "an", "the",
++         "this", "that", "my", "new", "some", "to", "for", "it", "is", "do", "if", "will", "pay", "paying", "need", "want",
++         "planning", "thinking", "about", "of", "how", "much", "cost", "costs", "costing", "worth", "priced", "price", "at",
++         "rs", "inr", "usd", "eur", "zar", "idr", "k", "which", "what", "whether", "really", "just", "me", "us", "now",
++         "going", "am", "are", "have", "has", "by", "on", "in", "within", "before", "until", "and", "or", "with", "without",
++         "rest", "later", "remaining", "deadline", "whenever", "tomorrow", "today", "tonight", "next", "week", "weeks", "month",
++         "months", "year", "years", "day", "days", "end", "half", "partial", "payment", "payments", "emi", "emis", "installment",
++         "installments", "full", "no", "not", "from", "then", "when", "ok", "okay", "please", "need", "wish", "like", "up", "down",
++         "january", "february", "march", "april", "june", "july", "august", "september", "october", "november", "december",
++         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
++
++
++def _pretty(words):
++    text = " ".join(words).strip()
++    if not text:
++        return None
++    return text[0].upper() + text[1:] if text == text.lower() else text
++
++
++def extract_item(text):
++    """The thing being bought, e.g. 'refrigerator', or None when it cannot be told."""
++    sentence = re.split(r"[?.!\n]", str(text or "").strip())[0]
++    match = re.search(r"\b(?:buy|purchase|get|afford|order|book|replace|upgrade to|renew|pay for)\s+(?:(?:a|an|the|my|new|some|this|that)\b\s*)?([A-Za-z][A-Za-z\- ]{1,40}?)"
++                      r"(?=\s+(?:worth|for|costing|costs?|priced|that|which|at|of|by|on|in|within|before|until|next|this)\b|\s*[\d₹$€]|$)", sentence, re.I)
++    if match:
++        words = [w for w in match.group(1).split() if w.lower() not in _STOP]
++        if words:
++            return _pretty(words)
++    leading = []
++    for word in re.findall(r"[A-Za-z][A-Za-z\-]*", sentence):
++        if word.lower() in _STOP:
++            if leading:
++                break
++            continue
++        leading.append(word)
++    return _pretty(leading[:3]) if leading else None
++
++
++def classify_intents(text):
++    """Questions that are not purchases, in the order asked: balance, max_affordable, upcoming, situation."""
++    low = str(text or "").lower()
++    intents = []
++    if re.search(r"\b(balance|how much (?:money|cash) do i have|how much do i have|what do i have)\b", low):
++        intents.append("balance")
++    if re.search(r"\b(most|maximum|max|highest|biggest|largest|how much)\b[^?.!]*\b(afford|spend|buy|pay|budget)\b|\bwhat can i (?:afford|buy|spend)\b|\bmy budget\b|\bspending (?:limit|capacity|power)\b", low):
++        intents.append("max_affordable")
++    if re.search(r"\b(upcoming|coming up|due soon|next few weeks)\b[^?.!]*\b(bills?|payments?|expenses?|outflows?|rent|emis?)\b|\bwhat (?:bills|payments|expenses)\b|\bwhen (?:is|will|do)[^?.!]*\b(salary|payday|paid|income|get paid)\b|\bnext (?:salary|payday|income)\b", low):
++        intents.append("upcoming")
++    if re.search(r"\b(situation|summary|overview|how am i doing|my finances)\b", low):
++        intents.append("situation")
++    return intents
++
++
++def parse_request(text, as_of, day_first=True):
++    """One pass over a sentence; fields not mentioned come back as None."""
++    deadline = parse_deadline_phrase(text, as_of, day_first=day_first)
++    mode = parse_payment_mode(text)
++    cleaned = str(text or "")
++    if deadline.get("span"):
++        cleaned = re.sub(re.escape(deadline["span"]), " ", cleaned, flags=re.I)
++    cleaned = re.sub(r"\b(?:pay(?:ing)? (?:it )?in full|without(?: any)? (?:installments?|emis?)|no (?:installments?|emis?)|"
++                     r"pay (?:half|\d+(?:\.\d+)?%) now|partial payment(?: ok(?:ay)?)?|\d+\s*(?:monthly\s+)?(?:installments?|emis?)|"
++                     r"in (?:three|six|twelve|\d+) (?:months|installments?))\b", " ", cleaned, flags=re.I)
++    intents = classify_intents(text)
++    return {"item": None if intents else extract_item(cleaned), "deadline": deadline, "mode": mode, "intents": intents}
+diff --git a/code/terminal_flow.py b/code/terminal_flow.py
+index b010f931..e14cd977 100644
+--- a/code/terminal_flow.py
++++ b/code/terminal_flow.py
+@@ -10,6 +10,8 @@ import failproofai_sdk as fp
+ from assistant import Assistant
+ from money import money
+ from plan_dates import installment_completion_date
++from request_parser import classify_intents, parse_deadline_phrase, parse_request
++import insights
+ 
+ 
+ _CURRENCIES = {"INR": "INR", "USD": "USD", "EUR": "EUR", "ZAR": "ZAR", "IDR": "IDR"}
+@@ -154,10 +156,20 @@ class TerminalSession:
+         return bool(count and deadline and installment_completion_date(self.as_of_date, count) > dt.date.fromisoformat(str(deadline)[:10]))
+ 
+     def _latest_date(self, user_id):
++        """Default as-of date: the user's latest request date (when the balance snapshot was taken),
++        else the day after their last event. Using the last event's own day would count that day's
++        events twice (once in the balance, once as scheduled flows)."""
+         import pandas as pd
++        for name in ("requests.csv", "sample_requests.csv"):
++            path = os.path.join(self.dataset_dir, name)
++            if os.path.exists(path):
++                frame = pd.read_csv(path, skipinitialspace=True)
++                dates = pd.to_datetime(frame[frame.user_id.astype(str).eq(str(user_id))].request_date, errors="coerce").dropna()
++                if not dates.empty:
++                    return dates.max().date().isoformat()
+         engine = Assistant(user_id, dt.date.today().isoformat(), dataset_dir=self.dataset_dir, no_llm=True).engine
+         dates = pd.to_datetime(engine.events[engine.events.user_id.astype(str).eq(str(user_id))].event_date, errors="coerce").dropna()
+-        return dates.max().date().isoformat() if not dates.empty else dt.date.today().isoformat()
++        return (dates.max().date() + dt.timedelta(days=1)).isoformat() if not dates.empty else dt.date.today().isoformat()
+ 
+     def _block(self, kind, text, data=None):
+         block = {"kind": kind, "text": str(text), "plain_text": str(text), "data": data or {}}
+@@ -218,33 +230,35 @@ class TerminalSession:
+             return [self._block("prompt", text, {"question": text, "options": []})]
+         self.request_text = line
+         home = str(self.assistant.engine.get_user_home_currency(self.user_id))
+-        self.form = {"amount": amount, "currency": currency or home,
+-                     "item": re.sub(r"\b(?:can i afford|should i buy|buy|costs?)\b", "", line, flags=re.I).strip(" ?.!$") or "payment",
++        parsed = parse_request(line, self.as_of_date, day_first=(str(currency or home).upper() != "USD"))
++        mode = parsed["mode"]
++        self.form = {"amount": amount, "currency": currency or home, "item": parsed["item"] or "payment",
+                      "allow_partial": False, "allow_installments": False,
+                      "installment_count": 3, "installment_fee_pct": 0.0}
+         lowered = line.lower()
+         self.questions = []
+         if not self._parse_deadline(line):
+             self.questions.append("deadline")
+-        if re.search(r"pay half now|partial payment", lowered):
++        if mode["allow_partial"] is True:
+             self.form["allow_partial"] = True
+-            if "pay half now" in lowered:
+-                self.form["partial_amount"] = amount * 0.5
+-        elif not re.search(r"\b(no partial|pay in full|full payment only)\b", lowered):
++            if mode["partial_fraction"]:
++                self.form["partial_amount"] = amount * mode["partial_fraction"]
++            elif mode["partial_amount_text"]:
++                partial, _ = parse_amount(mode["partial_amount_text"])
++                if partial is not None and 0 < partial < amount:
++                    self.form["partial_amount"] = partial
++        elif mode["allow_partial"] is None:
+             self.questions.append("partial")
+-        count = re.search(r"\b(\d+)\s+installments?\b", lowered)
+-        if count:
+-            self.form.update(allow_installments=True, installment_count=int(count.group(1)))
+-            fee_match = re.search(r"(\d+(?:\.\d+)?)\s*%", lowered)
++        if mode["allow_installments"] is True and mode["installment_count"]:
++            self.form.update(allow_installments=True, installment_count=int(mode["installment_count"]))
++            fee_match = re.search(r"(\d+(?:\.\d+)?)\s*%(?!\s*(?:now|upfront|up front|down))", lowered)
+             if fee_match:
+                 fee = float(fee_match.group(1))
+                 if 0 <= fee <= 30: self.form["installment_fee_pct"] = fee
+                 else: self.questions.append("fee")
+             else:
+                 self.questions.append("fee")
+-        elif "installment" not in lowered:
+-            self.questions.append("installments")
+-        else:
++        elif mode["allow_installments"] is not False:
+             self.questions.append("installments")
+         if self.form.get("allow_installments") and self.form.get("pay_by_date") and self._has_installment_conflict(self.form["pay_by_date"]):
+             deadline = self.form["pay_by_date"]
+@@ -266,32 +280,16 @@ class TerminalSession:
+         return self._make_report()
+ 
+     def _parse_deadline(self, text):
+-        if re.search(r"\b(no deadline|no due date|just advise)\b", text, re.I):
++        currency = str(self.form.get("currency") or "").upper()
++        parsed = parse_deadline_phrase(text, self.as_of_date, day_first=(currency != "USD"))
++        if parsed["no_deadline"]:
+             self.form["pay_by_date"] = None
+             return True
+-        iso = re.search(r"\b(20\d\d-\d\d-\d\d)\b", text)
+-        if iso:
+-            try:
+-                parsed = dt.date.fromisoformat(iso.group(1))
+-                today = dt.date.fromisoformat(self.as_of_date)
+-                if parsed >= today:
+-                    self.form["pay_by_date"] = parsed.isoformat()
+-                    return True
+-            except ValueError:
+-                pass
+-        relative = re.search(r"\bin\s+(\d+)\s+(days?|weeks?)\b", text, re.I)
+-        if relative:
+-            n = int(relative.group(1)); unit = relative.group(2).lower()
+-            self.form["pay_by_date"] = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=n * (7 if unit.startswith("week") else 1))).isoformat()
+-            return True
+-        if re.search(r"\bwithin 14 days\b", text, re.I):
+-            self.form["pay_by_date"] = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=14)).isoformat()
+-            return True
+-        if re.search(r"\bend of this month\b", text, re.I):
+-            day = dt.date.fromisoformat(self.as_of_date)
+-            next_month = day.replace(day=28) + dt.timedelta(days=4)
+-            self.form["pay_by_date"] = (next_month.replace(day=1) - dt.timedelta(days=1)).isoformat()
++        if parsed["date"] is not None:
++            self.form["pay_by_date"] = parsed["date"].isoformat()
+             return True
++        if parsed["past"]:
++            self._block("text", f"I ignored '{parsed['span']}' because it is before {self.as_of_date}.")
+         return False
+ 
+     def _accept_answer(self, line):
+@@ -409,12 +407,50 @@ class TerminalSession:
+         elif chosen["type"] == "wait": verdict = f"WAIT UNTIL {max(chosen['dates'])}"
+         else: verdict = "NOT RECOMMENDED"
+         situation = result["situation"]
+-        why = (f"The current balance is {money(situation['current_balance'], currency)}, and the minimum to keep is {money(situation['minimum_balance'], currency)}. "
+-               f"The lowest projected balance is {money(situation['lowest_projected_balance'], currency)} on {situation['lowest_projected_date']}. "
+-               f"Monthly counted income is {money(situation['monthly_income_total'], currency)}; only validated recurring income is counted.")
++        base = self._situation_cached()
++        minimum = float(situation["minimum_balance"])
++        amount = float(self.form["amount"])
++        balance_now = float(situation["current_balance"])
++        capacity = insights.safe_to_spend_today(base)
++        income = insights.upcoming_income(base, self.as_of_date)
++        bills = insights.upcoming_bills(base, days=30, limit=3, as_of=self.as_of_date)
++        full_option = next((x for x in options if x.get("type") == "pay_in_full_now"), None)
++        full_low = float(full_option["lowest_projected_balance"]) if full_option else None
++        cushion_after = (full_low - minimum) if full_low is not None else None
++        cushion_name = insights.cushion_label(cushion_after, minimum) if cushion_after is not None else None
++        deadline_text = f"pay by {self.form['pay_by_date']}" if self.form.get("pay_by_date") else "no deadline"
++        style = []
++        if self.form.get("allow_installments"):
++            fee = float(self.form.get("installment_fee_pct") or 0)
++            style.append(f"{self.form.get('installment_count', 3)} installments" + (f" at {fee:g}% fee" if fee else ""))
++        if self.form.get("allow_partial"):
++            style.append("partial payment OK")
++        understood = f"{self.form.get('item') or 'payment'} · {money(amount, currency)} · {deadline_text} · {', '.join(style) or 'paying in full'}"
++        why = (f"You have {money(balance_now, currency)} available and keep at least {money(minimum, currency)}, a cushion of {money(balance_now - minimum, currency)} today. "
++               f"Your balance is lowest on {situation['lowest_projected_date']} at {money(situation['lowest_projected_balance'], currency)} after upcoming bills, "
++               f"which leaves {money(capacity, currency)} you could safely spend in one payment today. ")
++        if income:
++            why += (f"Counted income over the next 90 days totals {money(situation['monthly_income_total'], currency)}; the next payment of "
++                    f"{money(income[0]['amount'], currency)} is expected on {income[0]['date']}.")
++        else:
++            why += "No recurring income is counted in the next 90 days."
++        skipped = [f"{item['series_key']} ({item['class'].replace('_', ' ')})" for item in result.get("income_stream_classes", [])
++                   if item.get("class") not in {"confirmed_recurring", "new_recurring"}]
++        if skipped:
++            why += " Not counted as reliable income: " + ", ".join(skipped) + "."
+         pending = situation.get("pending_items_considered_or_ignored", {})
+         why += (f" Pending items: considered {', '.join(map(str, pending.get('considered', []))) or 'none'}; "
+                 f"ignored {', '.join(map(str, pending.get('ignored', []))) or 'none'}.")
++        headroom = [f"Safe to spend today: {money(capacity, currency)}"]
++        if amount <= capacity + 0.005:
++            headroom.append(f"This purchase: {money(amount, currency)}, {amount / capacity * 100:.0f}% of that" if capacity > 0 else f"This purchase: {money(amount, currency)}")
++        else:
++            headroom.append(f"This purchase: {money(amount, currency)}, which is {money(amount - capacity, currency)} more than is safe today")
++        if cushion_after is not None:
++            headroom.append(f"After paying in full: lowest balance {money(full_low, currency)} on {full_option['lowest_projected_date']}, "
++                            f"{money(abs(cushion_after), currency)} {'above' if cushion_after >= 0 else 'below'} your minimum ({cushion_name})")
++        ahead = [("Next income: " + f"{money(income[0]['amount'], currency)} on {income[0]['date']}") if income else "Next income: none counted in the next 90 days"]
++        ahead += [f"Bill: {b['label']} {money(b['amount'], currency)} on {b['date']}" for b in bills] or ["Bills: none scheduled in the next 30 days"]
+         balances = result.get("evidence", {}).get("balances", {})
+         vals = list(balances.values())
+         levels = "▁▂▃▄▅▆▇█"
+@@ -432,11 +468,33 @@ class TerminalSession:
+             rows.append(f"{option['type'].replace('_',' '):22} {', '.join(option['dates']):20} {money(option['total_cost'],currency):16} {money(option['lowest_projected_balance'],currency):16} {meets}   {safe_mark} {'SAFE' if option.get('safe') else 'UNSAFE'}")
+             if not option.get("safe"):
+                 rows.append(f"                         Note: {safety}")
+-        other_safe = [x["type"].replace("_", " ") for x in options if x.get("safe") and x is not chosen]
+-        alts = [f"Best other safe options: {', '.join(other_safe) or 'none'}.",
+-                f"Earliest safe date to wait for: {situation.get('earliest_date_for_full_payment') or 'not available'}.",
+-                f"Amount safe to pay today: {money(result['decision'].get('amount_safe_to_pay', 0),currency)}.",
+-                f"Spending changes that would free cash: {result['decision'].get('spending_changes_needed', 'none')}."]
++        other_safe = [x for x in options if x.get("safe") and x is not chosen]
++        spending_changes = result["decision"].get("spending_changes_needed", "none")
++        pay_date = (sorted(chosen.get("dates") or []) or [self.as_of_date])[0] if chosen else self.as_of_date
++        alts = []
++        if verdict == "PAY IN FULL TODAY":
++            if cushion_name == "comfortable":
++                alts.append(f"Waiting or splitting would not make this meaningfully safer: you keep {money(cushion_after, currency)} above your minimum either way.")
++            else:
++                alts.append(f"Your cushion after paying is thin: {money(cushion_after, currency)} above your minimum.")
++                if income:
++                    wait_cushion = insights.capacity_from(base, income[0]["date"]) - amount
++                    if wait_cushion > cushion_after + 0.005:
++                        alts.append(f"Waiting until {income[0]['date']} (after {money(income[0]['amount'], currency)} of income) would leave about {money(wait_cushion, currency)} above your minimum.")
++        elif chosen is not None:
++            if full_option is not None and not full_option.get("safe"):
++                alts.append(f"Paying in full today would drop your balance to {money(full_low, currency)} on {full_option['lowest_projected_date']}, "
++                            f"{money(max(0.0, minimum - full_low), currency)} below your minimum.")
++        else:
++            alts.append(f"The most you can safely pay today is {money(capacity, currency)}.")
++            if amount > capacity:
++                alts.append(f"You are {money(amount - capacity, currency)} short for the full amount.")
++            earliest_full = situation.get("earliest_date_for_full_payment")
++            alts.append(f"The full amount becomes safe on {earliest_full}." if earliest_full else "The full amount does not become safe within the 90-day forecast.")
++        for option in other_safe:
++            alts.append(f"Also safe: {option['type'].replace('_', ' ')} (lowest balance {money(option['lowest_projected_balance'], currency)} on {option['lowest_projected_date']}).")
++        if str(spending_changes) != "none":
++            alts.append(f"Spending changes that would free cash: {spending_changes}.")
+         if verdict.startswith("NOT RECOMMENDED"):
+             steps = ["Do not make this payment now"]
+             safe_today = float(result["decision"].get("amount_safe_to_pay", 0) or 0)
+@@ -445,19 +503,40 @@ class TerminalSession:
+             earliest = situation.get("earliest_date_for_full_payment")
+             if earliest:
+                 steps.append(f"Earliest safe date: {earliest}.")
+-            spending_changes = result["decision"].get("spending_changes_needed", "none")
+-            steps.append(
+-                "This answer could change if income resumes, you choose a smaller amount, "
+-                f"or spending changes ({spending_changes})."
+-            )
++            steps.append("This answer could change if income resumes, you choose a smaller amount, "
++                         f"or spending changes ({spending_changes}).")
++        elif chosen["type"] == "pay_in_full_now":
++            steps = [f"Pay {money(amount, currency)} on {pay_date}."]
++            if situation["lowest_projected_date"] > pay_date:
++                steps.append(f"Your balance is lowest on {situation['lowest_projected_date']} ({money(full_low, currency)} after this payment); keep other large optional spending light until then.")
++            if income:
++                steps.append(f"Your next income, {money(income[0]['amount'], currency)}, is expected on {income[0]['date']}; recheck your balance after it arrives.")
++        elif chosen["type"] == "installments":
++            payments = list((chosen.get("amounts") or {}).items())
++            steps = [f"Pay {money(value, currency)} on {day}." for day, value in payments[:4]]
++            if len(payments) > 4:
++                steps.append(f"...and {len(payments) - 4} more payments, the last on {payments[-1][0]}.")
++            if float(chosen.get("total_cost", amount)) > amount + 0.005:
++                steps.append(f"Total cost including fees: {money(chosen['total_cost'], currency)}.")
++        elif chosen["type"] == "partial_then_remainder":
++            payments = list((chosen.get("amounts") or {}).items())
++            steps = [f"Pay {money(payments[0][1], currency)} on {payments[0][0]}.", f"Pay the remaining {money(payments[-1][1], currency)} on {payments[-1][0]}."]
+         else:
+-            steps = [f"Confirm the selected plan for {money(self.form['amount'],currency)}.", "Keep the minimum balance available.", "Recheck the forecast before making the payment."]
++            wait_day = max(chosen.get("dates") or [self.as_of_date])
++            steps = [f"Wait until {wait_day}, then pay {money(amount, currency)} in full.",
++                     f"On that date your balance needs to be at least {money(amount + minimum, currency)}; the forecast says it will be."]
++        self._sections = {"understood": understood, "why": why, "headroom": headroom, "ahead": ahead,
++                          "alternatives": alts, "next_steps": steps}
+         dates = list(balances)
+         start_date = dates[0] if dates else self.as_of_date
+         end_date = dates[-1] if dates else (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
+         start_balance = vals[0] if vals else situation["current_balance"]
+         end_balance = vals[-1] if vals else situation["current_balance"]
+-        return (f"╭─ {verdict} ─╮\nWHY\n{why}\n\nNUMBERS\n90-day balance: {spark}\nMinimum-balance level: {money(minimum,currency)}\n{start_date} {money(start_balance,currency)} → {end_date} {money(end_balance,currency)}\n\nOPTIONS\n" + "\n".join(rows) + "\n\nALTERNATIVES\n" + "\n".join("• "+s for s in alts) + "\n\nNEXT STEPS\n" + "\n".join("• "+s for s in steps) + "\n╰" + "─" * max(10, len(verdict) + 4) + "╯")
++        return (f"╭─ {verdict} ─╮\nUNDERSTOOD AS\n{understood}\n\nWHY\n{why}\n\nHEADROOM\n" + "\n".join("• " + s for s in headroom)
++                + "\n\nAHEAD\n" + "\n".join("• " + s for s in ahead)
++                + f"\n\nNUMBERS\n90-day balance: {spark}\nMinimum-balance level: {money(minimum,currency)}\n{start_date} {money(start_balance,currency)} → {end_date} {money(end_balance,currency)}\n\nOPTIONS\n"
++                + "\n".join(rows) + "\n\nALTERNATIVES\n" + "\n".join("• "+s for s in alts) + "\n\nNEXT STEPS\n" + "\n".join("• "+s for s in steps)
++                + "\n╰" + "─" * max(10, len(verdict) + 4) + "╯")
+ 
+     def report_data(self, result):
+         rendered = self.render_report(result)
+@@ -484,11 +563,12 @@ class TerminalSession:
+                             "meets_deadline": "n/a" if item.get("meets_deadline") is None else ("yes" if item.get("meets_deadline") else "no"),
+                             "safe": bool(item.get("safe")),
+                             "note": "" if item.get("safe") else f"Unsafe: drops to {money(low, self.form['currency'])} on {item.get('lowest_projected_date')}"})
+-        sections = rendered.split("\n\nALTERNATIVES\n")
+-        alternatives = sections[-1].split("\n\nNEXT STEPS\n")[0].splitlines() if len(sections) > 1 else []
+-        next_steps = rendered.split("\n\nNEXT STEPS\n", 1)[-1].split("\n╰", 1)[0].splitlines()
++        stored = getattr(self, "_sections", {})
++        alternatives = ["• " + s for s in stored.get("alternatives", [])]
++        next_steps = ["• " + s for s in stored.get("next_steps", [])]
+         return {"verdict": verdict, "status": status,
+-                "why": rendered.split("WHY\n", 1)[-1].split("\n\nNUMBERS", 1)[0],
++                "why": stored.get("why", ""), "understood": stored.get("understood", ""),
++                "headroom": stored.get("headroom", []), "ahead": stored.get("ahead", []),
+                 "numbers": {"sparkline_values": values, "minimum": situation["minimum_balance"],
+                             "start_date": dates[0] if dates else self.as_of_date,
+                             "end_date": dates[-1] if dates else self.as_of_date,
+@@ -524,7 +604,7 @@ class TerminalSession:
+             pending = s.get("pending_items", s.get("pending_items_considered_or_ignored", {}))
+             self._block("text", (f"Balance: {money(s['current_balance'],c)}; minimum: {money(s['minimum_balance'],c)}; "
+                                   f"lowest projected balance: {money(s['lowest_projected_balance'],c)} on {s.get('lowest_projected_date', 'n/a')}; "
+-                                  f"income counted: {money(s.get('monthly_income_total', 0),c)}; "
++                                  f"income counted over 90 days: {money(s.get('monthly_income_total', 0),c)}; "
+                                   f"outflows next 30 days: {money(outflows,c)}; next 90 days: {money(outflows90,c)}; "
+                                   f"pending items: {pending}; as of {self.as_of_date}."))
+         elif command == "/reset":
+@@ -542,7 +622,7 @@ class TerminalSession:
+         elif command.startswith("/date "):
+             value = text.split(maxsplit=1)[1]
+             all_dates = self.assistant.engine.events[self.assistant.engine.events.user_id.astype(str).eq(self.user_id)].event_date.dropna().astype(str)
+-            lo, hi = sorted(map(str, all_dates))[0][:10], sorted(map(str, all_dates))[-1][:10]
++            lo, hi = sorted(map(str, all_dates))[0][:10], max(sorted(map(str, all_dates))[-1][:10], self._latest_date(self.user_id))
+             try:
+                 date = dt.date.fromisoformat(value)
+                 if not lo <= value <= hi: raise ValueError
+@@ -577,10 +657,17 @@ class TerminalSession:
+                 report_text = self.render_report(self.report)
+                 why = report_text.split("WHY\n", 1)[-1].split("\n\nNUMBERS", 1)[0]
+                 self._block("text", why)
++            elif classify_intents(text) and parse_amount(text)[0] is None:
++                self._answer_intents(classify_intents(text))
+             else:
+                 previous = self._comparison(self.report) if self.report else None
+                 changed = self._apply_followup(text)
+-                if changed:
++                if not changed and text and parse_amount(text)[0] is not None:
++                    self._block("text", "Starting a new request.")
++                    self.phase = "ready"
++                    self.form = {}; self.questions = []; self.question_index = 0
++                    self._start(text)
++                elif changed:
+                     blocks = self._make_report()
+                     if self.report and previous:
+                         comparison = self._block("text", "WHAT CHANGED\n" + self._comparison(self.report, previous))
+@@ -588,10 +675,60 @@ class TerminalSession:
+                         self.last_blocks.insert(0, comparison)
+                 elif text:
+                     self._block("text", "I didn't understand that. Try: 'pay half now', 'wait a month', '6 installments', 'actually 20k', or /help.")
++        elif classify_intents(text) and parse_amount(text)[0] is None:
++            self._answer_intents(classify_intents(text))
+         else:
+             self._start(text)
+         return self.last_blocks
+ 
++    def _situation_cached(self):
++        key = (self.user_id, self.as_of_date)
++        if getattr(self, "_situation_key", None) != key:
++            self._situation_value = self.assistant.situation()
++            self._situation_key = key
++        return self._situation_value
++
++    def _answer_intents(self, intents):
++        """Answer non-purchase questions from the forecast; every figure comes from the situation."""
++        s = self._situation_cached()
++        c = str(self.assistant.engine.get_user_home_currency(self.user_id))
++        minimum = float(s["minimum_balance"])
++        capacity = insights.safe_to_spend_today(s)
++        income = insights.upcoming_income(s, self.as_of_date)
++        for intent in intents:
++            if intent == "balance":
++                self._block("text", "BALANCE\n"
++                            f"Available now: {money(s['current_balance'], c)}\n"
++                            f"Minimum you keep: {money(minimum, c)}\n"
++                            f"Cushion today: {money(float(s['current_balance']) - minimum, c)} (available minus minimum)\n"
++                            f"Lowest projected balance in the next 90 days: {money(s['lowest_projected_balance'], c)} on {s['lowest_projected_date']}")
++            elif intent == "max_affordable":
++                lines = ["WHAT YOU CAN SAFELY SPEND",
++                         f"In one payment today: {money(capacity, c)}",
++                         f"(your lowest projected balance, {money(s['lowest_projected_balance'], c)} on {s['lowest_projected_date']}, minus the {money(minimum, c)} you keep)"]
++                if income:
++                    later = insights.capacity_from(s, income[0]["date"])
++                    if later > capacity + 0.005:
++                        lines.append(f"From {income[0]['date']} (after {money(income[0]['amount'], c)} of income): {money(later, c)}")
++                lines.append("Ask about a specific purchase, for example 'Can I afford a laptop for 40k?', for a full plan.")
++                self._block("text", "\n".join(lines))
++            elif intent == "upcoming":
++                lines = ["AHEAD (next 30 days)"]
++                lines.append(("Next income: " + ", ".join(f"{money(i['amount'], c)} on {i['date']}" for i in income[:2])) if income
++                             else "Next income: none counted in the next 90 days")
++                bills = insights.upcoming_bills(s, days=30, limit=5, as_of=self.as_of_date)
++                lines.append("Biggest bills:" if bills else "Biggest bills: none scheduled")
++                lines += [f"  {b['date']}  {b['label']}  {money(b['amount'], c)}" for b in bills]
++                daily = insights.everyday_spending_per_day(s)
++                if daily > 0:
++                    lines.append(f"Everyday spending is projected at about {money(daily, c)} per day.")
++                self._block("text", "\n".join(lines))
++            elif intent == "situation":
++                saved = list(self.last_blocks)
++                self.handle("/situation")
++                self.last_blocks = saved + self.last_blocks
++        return self.last_blocks
++
+     def _comparison(self, result, previous=None):
+         result = result or {}
+         current = {
+diff --git a/tests/test_request_parser.py b/tests/test_request_parser.py
+new file mode 100644
+index 00000000..5a256a00
+--- /dev/null
++++ b/tests/test_request_parser.py
+@@ -0,0 +1,116 @@
++import datetime as dt
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "code"))
++import insights  # noqa: E402
++from request_parser import classify_intents, extract_item, parse_deadline_phrase, parse_payment_mode, parse_request  # noqa: E402
++
++AS_OF = dt.date(2024, 9, 4)  # a Wednesday
++
++
++@pytest.mark.parametrize("text,expected", [
++    ("by the end of next month", dt.date(2024, 10, 31)),
++    ("by the end of this month", dt.date(2024, 9, 30)),
++    ("end of the year", dt.date(2024, 12, 31)),
++    ("in 10 days", dt.date(2024, 9, 14)),
++    ("within 2 weeks", dt.date(2024, 9, 18)),
++    ("within a month", dt.date(2024, 10, 4)),
++    ("in three months", dt.date(2024, 12, 4)),
++    ("tomorrow", dt.date(2024, 9, 5)),
++    ("next week", dt.date(2024, 9, 11)),
++    ("next month", dt.date(2024, 10, 4)),
++    ("by friday", dt.date(2024, 9, 6)),
++    ("by monday", dt.date(2024, 9, 9)),
++    ("by 15 Dec", dt.date(2024, 12, 15)),
++    ("by December 15th", dt.date(2024, 12, 15)),
++    ("by the 20th", dt.date(2024, 9, 20)),
++    ("by December", dt.date(2024, 12, 31)),
++    ("on 2024-12-01", dt.date(2024, 12, 1)),
++    ("by 31/12/2024", dt.date(2024, 12, 31)),
++])
++def test_deadline_phrases(text, expected):
++    assert parse_deadline_phrase(text, AS_OF)["date"] == expected
++
++
++def test_deadline_flags_and_locale():
++    assert parse_deadline_phrase("by 2020-01-01", AS_OF)["past"] is True
++    assert parse_deadline_phrase("by 2020-01-01", AS_OF)["date"] is None
++    assert parse_deadline_phrase("no deadline please", AS_OF)["no_deadline"] is True
++    assert parse_deadline_phrase("by 03/04/2025", AS_OF, day_first=True)["date"] == dt.date(2025, 4, 3)
++    assert parse_deadline_phrase("by 03/04/2025", AS_OF, day_first=False)["date"] == dt.date(2025, 3, 4)
++    assert parse_deadline_phrase("laptop 12k", AS_OF)["date"] is None
++
++
++@pytest.mark.parametrize("text,installments,count,partial", [
++    ("I will pay in full without any installments", False, None, False),
++    ("buy a sofa worth 95k in full", False, None, False),
++    ("I can't pay in full", None, None, None),
++    ("no emi please", False, None, None),
++    ("pay in 6 installments", True, 6, None),
++    ("three monthly payments", True, 3, None),
++    ("partial payment is fine", None, None, True),
++    ("laptop 12k", None, None, None),
++])
++def test_payment_mode(text, installments, count, partial):
++    mode = parse_payment_mode(text)
++    assert (mode["allow_installments"], mode["installment_count"], mode["allow_partial"]) == (installments, count, partial)
++
++
++def test_payment_mode_fractions():
++    assert parse_payment_mode("pay half now")["partial_fraction"] == 0.5
++    assert parse_payment_mode("pay 20% now")["partial_fraction"] == pytest.approx(0.2)
++    assert parse_payment_mode("pay 10k now and the rest later")["partial_amount_text"].startswith("10k")
++
++
++@pytest.mark.parametrize("text,item", [
++    ("Can I buy a Refrigerator worth 50k INR by the end of next month?", "Refrigerator"),
++    ("laptop 12k", "Laptop"),
++    ("TV 45,000 by the 20th", "TV"),
++    ("Can I afford an iPhone 15 for 80000", "iPhone"),
++    ("pay 10k now and rest later for the sofa", "Sofa"),
++])
++def test_item_extraction(text, item):
++    assert extract_item(parse_request_cleaned(text)) == item
++
++
++def parse_request_cleaned(text):
++    return text
++
++
++def test_intents():
++    assert classify_intents("what is my current bank balance?") == ["balance"]
++    assert classify_intents("what is the most expensive thing I can afford right now") == ["max_affordable"]
++    assert classify_intents("what bills are coming up?") == ["upcoming"]
++    assert classify_intents("when is my next salary?") == ["upcoming"]
++    assert classify_intents("what is my balance? what is the most I can afford?") == ["balance", "max_affordable"]
++    assert classify_intents("Can I buy a Refrigerator worth 50k INR by the end of next month?") == []
++
++
++def test_full_sentence_is_cut_into_all_parts():
++    parsed = parse_request("Can I buy a Refrigerator worth 50k INR by the end of next month? I will pay in full without any installments", AS_OF)
++    assert parsed["item"] == "Refrigerator"
++    assert parsed["deadline"]["date"] == dt.date(2024, 10, 31)
++    assert parsed["mode"]["allow_installments"] is False and parsed["mode"]["allow_partial"] is False
++    assert parsed["intents"] == []
++
++
++SITUATION = {"minimum_balance": 100.0, "lowest_projected_balance": 350.0,
++             "balances": {"2024-01-01": 500.0, "2024-01-02": 350.0, "2024-01-03": 700.0},
++             "breakdown": {"flows_by_day": {
++                 "2024-01-02": [{"source": "recurring_series", "amount": -150.0, "description": "Rent", "category": "rent"},
++                                {"source": "scheduled_event", "amount": -150.0, "description": "Rent", "category": "rent"}],
++                 "2024-01-03": [{"source": "income", "amount": 350.0, "description": "Pay"}]}}}
++
++
++def test_insights_capacity_income_and_bills():
++    assert insights.safe_to_spend_today(SITUATION) == 250.0
++    assert insights.capacity_from(SITUATION, "2024-01-03") == 600.0
++    assert insights.upcoming_income(SITUATION, "2024-01-01") == [{"date": "2024-01-03", "amount": 350.0, "label": "Pay"}]
++    bills = insights.upcoming_bills(SITUATION, days=30, as_of="2024-01-01")
++    assert len(bills) == 1 and bills[0]["amount"] == 150.0  # duplicate scheduled + recurring rent counted once
++    assert insights.cushion_label(-1, 100) == "unsafe"
++    assert insights.cushion_label(5, 100) == "tight"
++    assert insights.cushion_label(50, 100) == "comfortable"
+diff --git a/tests/test_terminal_flow.py b/tests/test_terminal_flow.py
+index 4c785490..653a35d3 100644
+--- a/tests/test_terminal_flow.py
++++ b/tests/test_terminal_flow.py
+@@ -81,7 +81,7 @@ def test_report_verdict_controls_steps_and_pending_items_are_reported_once():
+     result = session.report
+     rendered = session.render_report(result)
+     if result["recommended_option"]:
+-        assert "Confirm the selected plan" in rendered
++        assert "NEXT STEPS\n• Pay " in rendered
+         assert "Do not make this payment now" not in rendered
+ 
+     result["recommended_option"] = None
+@@ -279,3 +279,56 @@ def test_situation_shows_actual_30_and_90_day_outflows():
+     situation = session.assistant.situation()
+     assert f"outflows next 30 days: INR {situation['committed_outflows_next_30_days']:,.2f}" in text
+     assert f"next 90 days: INR {situation['committed_outflows_next_90_days']:,.2f}" in text
++
++
++REFRIGERATOR = "Can I buy a Refrigerator worth 50k INR by the end of next month? I will pay in full without any installments"
++
++
++def _report_text(blocks):
++    return "\n".join(block["plain_text"] for block in blocks if block["kind"] == "report")
++
++
++def test_default_as_of_is_the_users_request_date_not_the_last_event_day():
++    assert TerminalSession("user_07").as_of_date == "2024-09-05"
++
++
++def test_one_sentence_with_everything_goes_straight_to_the_report():
++    session = TerminalSession("user_07")
++    blocks = session.handle(REFRIGERATOR)
++    assert [block["kind"] for block in blocks] == ["report"]
++    text = _report_text(blocks)
++    assert "Refrigerator · INR 50,000.00 · pay by 2024-10-31 · paying in full" in text
++    for section in ("UNDERSTOOD AS", "WHY", "HEADROOM", "AHEAD", "OPTIONS", "ALTERNATIVES", "NEXT STEPS"):
++        assert section in text
++    assert "None" not in text and "Recheck the forecast before making the payment" not in text
++
++
++def test_a_new_sentence_after_a_report_starts_a_new_request():
++    session = TerminalSession("user_07")
++    session.handle(REFRIGERATOR)
++    blocks = session.handle("Can I buy a phone worth 20k by the end of this month? I will pay in full")
++    text = _report_text(blocks)
++    assert "Phone · INR 20,000.00" in text
++    assert "I didn't understand" not in "\n".join(block["plain_text"] for block in blocks)
++
++
++def test_in_full_skips_partial_and_installment_questions():
++    session = TerminalSession("user_07")
++    assert session.handle("buy a sofa worth 95k in full")[0]["data"]["question"] == "When do you need to pay?"
++    assert [block["kind"] for block in session.handle("1")] == ["report"]
++
++
++def test_balance_max_affordable_and_upcoming_questions_are_answered_from_the_forecast():
++    session = TerminalSession("user_07")
++    text = "\n".join(b["plain_text"] for b in session.handle("what is my current bank balance? what is the most expensive thing I can afford right now"))
++    assert "BALANCE" in text and "WHAT YOU CAN SAFELY SPEND" in text and "103,080.99" in text
++    ahead = "\n".join(b["plain_text"] for b in session.handle("what bills are coming up?"))
++    assert "AHEAD (next 30 days)" in ahead and "Monthly rent" in ahead
++
++
++def test_report_headroom_equals_the_forecast_capacity():
++    import insights
++    session = TerminalSession("user_07")
++    text = _report_text(session.handle(REFRIGERATOR))
++    capacity = insights.safe_to_spend_today(session._situation_cached())
++    assert f"Safe to spend today: INR {capacity:,.2f}" in text

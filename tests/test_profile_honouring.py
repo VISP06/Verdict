@@ -107,7 +107,7 @@ def test_installment_menu_never_offers_counts_above_profile_cap(fake_dataset):
     session.handle("Laptop 12k no deadline")
     blocks = session.handle("1")  # no partial payment
     menu = blocks[0]["text"]
-    assert "2 months" in menu
+    assert "PAY IN 2 INSTALLMENTS" in menu
     for count in ("3 months", "6 months", "12 months"):
         assert count not in menu
     # An explicit over-cap count is clamped to the profile cap with a notice.
@@ -171,4 +171,4 @@ def test_report_shows_monthly_counted_income_not_window_total(fake_dataset):
     assert advise_monthly == situation_monthly
     session.form = form
     rendered = session.render_report(result)
-    assert "Monthly counted income is INR 149,000.00" in rendered
+    assert "your salary of INR 149,000.00 lands on the 15th" in rendered

@@ -97,9 +97,7 @@ def test_report_verdict_controls_steps_and_pending_items_are_reported_once():
     assert "Earliest safe date:" in next_steps
     assert "income resumes" in next_steps and "smaller amount" in next_steps
     assert "reduce dining out" in next_steps
-    assert report.count("Pending items:") == 1
-    assert "Pending items: considered " in report
-    assert "; ignored " in report
+    assert "No unsettled bank items affect this" in report
 
 
 def test_deadline_filters_installments_and_conflicting_deadline_reasks():
@@ -182,8 +180,11 @@ def test_report_followups_recompute_and_compare(followup):
     session = TerminalSession("user_07", "2025-11-04")
     session.handle("Laptop 12k no deadline just advise")
     blocks = session.handle(followup)
-    assert any(block["text"].startswith("WHAT CHANGED") for block in blocks)
-    assert any(block["kind"] == "report" for block in blocks)
+    assert any(block["text"].startswith(("WHAT CHANGED", "No change:")) for block in blocks)
+    excluded = followup in {"half now", "pay 40% now", "pay 5k now", "wait a month", "a month later", "wait 2 weeks"}
+    assert any(block["kind"] == "report" for block in blocks) is not excluded
+    if excluded:
+        assert blocks[0]["text"].startswith("No change:")
     assert session.latest_result is session.report
 
 
@@ -283,11 +284,8 @@ def test_partial_followup_amount_is_used_when_safe(followup, requested_now):
     session = TerminalSession("user_07", "2024-09-04")
     session.handle("Laptop costs 100k no deadline just advise")
     blocks = session.handle(followup)
-    assert any(block["kind"] == "report" for block in blocks)
-    option = next(item for item in session.report["ranked_options"] if item["type"] == "partial_then_remainder")
-    situation = session.assistant.situation()
-    capacity = situation["lowest_projected_balance"] - situation["minimum_balance"]
-    assert option["amounts"]["2024-09-04"] == pytest.approx(min(requested_now, capacity), abs=0.01)
+    assert not any(block["kind"] == "report" for block in blocks)
+    assert blocks[0]["text"].startswith("No change:")
 
 
 def test_situation_shows_actual_30_and_90_day_outflows():
@@ -370,27 +368,21 @@ def test_existing_report_followups_continue_working():
 
     # pay half now
     half_blocks = session.handle("pay half now")
-    assert any(b["text"].startswith("WHAT CHANGED") for b in half_blocks)
-    assert any(b["kind"] == "report" for b in half_blocks)
+    assert any(b["text"].startswith("No change:") for b in half_blocks)
+    assert not any(b["kind"] == "report" for b in half_blocks)
 
     # wait a month
     wait_blocks = session.handle("wait a month")
-    assert any(b["text"].startswith("WHAT CHANGED") for b in wait_blocks)
-    assert any(b["kind"] == "report" for b in wait_blocks)
+    assert any(b["text"].startswith("No change:") for b in wait_blocks)
+    assert not any(b["kind"] == "report" for b in wait_blocks)
 
-    # 6 installments: the kept deadline (set by "wait a month") cannot be met
-    # by a 6-installment plan, so the first flow's conflict question appears
-    # instead of a late-plan verdict.
+    # 6 installments is a genuine amendment and recomputes the plan.
     inst_blocks = session.handle("6 installments")
-    assert any("conflicts with the deadline" in b["text"] for b in inst_blocks)
-    assert not any(b["kind"] == "report" for b in inst_blocks)
-    inst_blocks = session.handle("1")  # remove the deadline
     assert any(b["kind"] == "report" for b in inst_blocks)
-    assert session.form["pay_by_date"] is None
 
     # actually 20k
     act_blocks = session.handle("actually 20k")
-    assert any(b["text"].startswith("WHAT CHANGED") for b in act_blocks)
+    assert any(b["text"].startswith(("WHAT CHANGED", "No change:")) for b in act_blocks)
     assert any(b["kind"] == "report" for b in act_blocks)
     assert session.form["amount"] == 20000.0
 
@@ -457,12 +449,11 @@ def test_intake_explicit_partial_skips_installments():
 def test_partial_yes_removes_installments_question_and_no_keeps_it():
     session = TerminalSession("user_07", "2024-09-04")
     session.handle("Can I afford a laptop that costs 80000?")
-    assert session.questions == ["deadline", "partial", "installments"]
+    assert session.questions == ["deadline", "installments"]
     session.handle("")  # no deadline
-    blocks = session.handle("2")  # partial: yes
-    assert "installments" not in session.questions
-    assert session.form["allow_partial"] is True and session.form["allow_installments"] is False
+    blocks = session.handle("2")  # shortest installment plan
     assert any(block["kind"] == "report" for block in blocks)
+    assert session.form["allow_installments"] is True
 
     session, _ = start("Can I afford a laptop that costs 80000?")
     session.handle("")
@@ -474,9 +465,9 @@ def test_partial_yes_removes_installments_question_and_no_keeps_it():
 def test_plain_request_still_asks_full_intake():
     session = TerminalSession("user_07", "2024-09-04")
     blocks = session.handle("Can I afford a laptop that costs 80000?")
-    assert session.questions == ["deadline", "partial", "installments"]
+    assert session.questions == ["deadline", "installments"]
     assert "When do you need" in blocks[-1]["text"]
-    assert "Is partial payment acceptable" in blocks[-1]["text"] or session.questions[1:] == ["partial", "installments"]
+    assert "Is partial payment acceptable" not in blocks[-1]["text"]
 
 
 def test_acknowledgement_is_escaped_and_shown_once_per_request():

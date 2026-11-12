@@ -125,9 +125,7 @@ for block_index, block in enumerate(output):
     elif kind == "report":
         st.markdown(report_html(block), unsafe_allow_html=True)
         if block_index == latest_report_index:
-            chip_lines = [("Pay half now", "pay half now"), ("Wait a month", "wait a month"),
-                          ("Use 3 installments", "3 installments"), ("Why not now?", "why not now"),
-                          ("/why", "/why")]
+            chip_lines = session.quick_replies()
             cols = st.columns(len(chip_lines) + 1)
             for col, (label, value) in zip(cols, chip_lines):
                 if col.button(label, key=f"followup_{block_index}_{label}"):

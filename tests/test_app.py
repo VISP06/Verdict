@@ -69,7 +69,7 @@ def test_clicking_deadline_option_advances_intake(monkeypatch):
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
     at.chat_input[0].set_value("Laptop costs 12k").run()
     next(button for button in at.button if button.label.startswith("Within 14 days")).click().run()
-    assert "partial payment" in "\n".join(x.value for x in at.markdown)
+    assert "how many installments" in "\n".join(x.value for x in at.markdown).lower()
 
 
 def test_date_picker_confirm_path(monkeypatch):
@@ -81,18 +81,18 @@ def test_date_picker_confirm_path(monkeypatch):
     at.date_input[0].set_value(dt.date(2025, 11, 20))
     next(button for button in at.button if button.label == "Confirm date").click().run()
     assert not at.exception
-    assert "partial payment" in "\n".join(x.value for x in at.markdown)
+    assert "installments" in "\n".join(x.value for x in at.markdown).lower()
 
 
 def test_report_followup_chip_recomputes_report(monkeypatch):
     _offline(monkeypatch)
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
     at.chat_input[0].set_value("Laptop costs 12k no deadline just advise").run()
-    assert any(button.label == "Pay half now" for button in at.button)
-    next(button for button in at.button if button.label == "Pay half now").click().run()
+    assert not any(button.label == "Pay half now" for button in at.button)
+    next(button for button in at.button if button.label.startswith("Use 3 installments")).click().run()
     assert not at.exception
     rendered = "\n".join(x.value for x in at.markdown)
-    assert "WHAT CHANGED" in rendered
+    assert "No change:" in rendered or "WHAT CHANGED" in rendered
     assert "Download report" in [button.label for button in at.button] or len(at.get("download_button")) > 0
 
 
@@ -127,12 +127,11 @@ def test_full_conversation_with_clicks_only_and_choice_echoed(monkeypatch):
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=60).run()
     at.chat_input[0].set_value("Laptop costs 12k").run()
     _click(at, "No deadline")
-    _click(at, "No, pay it in full")
-    _click(at, "No installments")
+    _click(at, "3 monthly payments")
     html = "\n".join(x.value for x in at.markdown)
     # The interactive path honours the profile: user_07 considers installments
     # only, so declining installments leaves no method the profile allows and
     # the deterministic report is NOT RECOMMENDED.
-    assert "NOT RECOMMENDED" in html
-    assert "No deadline" in html and "No installments" in html  # choices echoed by label, not key
+    assert "PAY IN 3 INSTALLMENTS" in html
+    assert "No deadline" in html and "3 monthly payments" in html
     assert "\u276f 1<" not in html

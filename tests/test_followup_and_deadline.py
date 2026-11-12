@@ -229,11 +229,9 @@ def test_installments_not_mentioned_before_asking_when_not_chosen(fake_dataset):
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Laptop 12k end of this month")
     assert session.form["pay_by_date"] == "2024-09-30"
-    assert not any("installment" in block["text"].lower() for block in blocks)
-    blocks = session.handle("1")  # partial: no
-    assert "Use installments?" in blocks[-1]["text"]
-    blocks = session.handle("2")  # 3 months: finishes 2024-11-04, after the deadline
-    assert any("conflicts with the deadline 2024-09-30" in block["text"] for block in blocks)
+    assert any("how many installments" in block["text"].lower() for block in blocks)
+    blocks = session.handle("1")  # shortest installment plan
+    assert "conflicts with the deadline" in " ".join(block["text"] for block in blocks)
     blocks = session.handle("1")  # remove the deadline
     assert session.form["pay_by_date"] is None
     assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
@@ -246,10 +244,8 @@ def test_deadline_question_answer_does_not_pre_filter_unchosen_installments(fake
     session.handle("Laptop 12k")
     blocks = session.handle("2")  # within 14 days -> 2024-09-19
     assert not any("No installment option completes by" in block["text"] for block in blocks)
-    assert "Is partial payment acceptable?" in blocks[-1]["text"]
-    blocks = session.handle("1")  # partial: no
-    assert "Use installments?" in blocks[-1]["text"]
-    blocks = session.handle("2")  # 3 months conflicts with the deadline
+    assert "How many installments?" in blocks[-1]["text"]
+    blocks = session.handle("1")  # shortest plan
     assert any("conflicts with the deadline 2024-09-19" in block["text"] for block in blocks)
     blocks = session.handle("1")  # remove the deadline
     assert session.form["pay_by_date"] is None
@@ -263,8 +259,8 @@ def test_earlier_disallowed_safe_options_wording(fake_dataset):
     _assistant, session = _session(fake_dataset)
     session.handle("Laptop 12k no deadline just advise")
     alts = session.render_report(session.report).split("ALTERNATIVES\n", 1)[1].split("\n\nNEXT STEPS\n")[0]
-    assert "Earlier options exist but aren't among the payment methods you accept." in alts
-    assert "The selected plan is the earliest way" not in alts
+    assert "Paying in full today would be safe, but it isn't among the payment methods you accept." in alts
+    assert "Earlier options exist" not in alts
     full_option = next(option for option in session.report["ranked_options"]
                        if option["type"] == "pay_in_full_now")
     assert full_option["safe"] is True
@@ -286,3 +282,43 @@ def test_item_extraction_drops_relative_pronoun(fake_dataset):
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Can I afford a laptop that costs 80000?")
     assert "Got it: INR 80,000.00 · laptop · no deadline given yet." == blocks[0]["text"]
+
+
+def test_profile_gates_questions_chips_and_neutral_followups(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    blocks = session.handle("Laptop 12k")
+    prompt_text = " ".join(block["text"] for block in blocks)
+    assert "Is partial payment acceptable?" not in prompt_text
+    blocks = session.handle("")
+    prompt_text = " ".join(block["text"] for block in blocks)
+    assert "How many installments?" in prompt_text
+    labels = [label for label, _value in session.quick_replies()]
+    assert "Pay half now" not in labels
+    assert "Wait a month" not in labels
+    assert "Use 3 installments" in labels
+    session.handle("1")
+    blocks = session.handle("wait a month")
+    assert blocks[0]["text"].startswith("No change:")
+    assert "installments only" in blocks[0]["text"]
+
+
+def test_plain_why_and_why_not_now_use_distinct_evidence(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    session.handle("Laptop 12k no deadline just advise")
+    report = session.report
+    rendered = session.render_report(report)
+    why = rendered.split("WHY\n", 1)[1].split("\n\nNUMBERS", 1)[0]
+    assert "[Profile]" in why and "[Bank history]" in why
+    assert "[Income pattern]" in why
+    assert "No unsettled bank items affect this" in why
+    not_now = session.handle("why not now")[0]["text"]
+    assert "would be safe" in not_now
+    assert "You told us you only consider" in not_now
+    assert not_now != why
+
+
+def test_safe_but_profile_excluded_payment_is_disclosed(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    session.handle("Laptop 12k no deadline just advise")
+    alternatives = session.render_report(session.report).split("ALTERNATIVES\n", 1)[1]
+    assert "Paying in full today would be safe, but it isn't among the payment methods you accept." in alternatives

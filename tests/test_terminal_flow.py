@@ -103,11 +103,19 @@ def test_report_verdict_controls_steps_and_pending_items_are_reported_once():
 
 
 def test_deadline_filters_installments_and_conflicting_deadline_reasks():
-    # End-of-month deadline is earlier than the shortest available 3-payment plan.
+    # With a deadline but no installments chosen, nothing about installments is
+    # mentioned before the question is asked; the conflict appears only after
+    # the user answers "Use installments?".
     session, blocks = start("Laptop 12k end of this month")
     assert session.form["pay_by_date"] == "2025-11-30"
-    assert any("shortest plan ends on 2026-01-03" in block["text"] for block in blocks)
-    assert not any("Use installments?" in block["text"] for block in blocks)
+    assert not any("installment" in block["text"].lower() for block in blocks)
+    blocks = session.handle("1")  # partial: no
+    assert "Use installments?" in blocks[-1]["text"]
+    blocks = session.handle("2")  # 3 months: finishes 2026-01-03, after the deadline
+    assert any("conflicts with the deadline" in block["text"] for block in blocks)
+    blocks = session.handle("1")  # remove the deadline
+    assert session.form["pay_by_date"] is None
+    assert any(block["kind"] == "report" for block in blocks)
 
     # If an installment count was stated first, a conflicting deadline is rejected
     # and the replacement prompt allows only no deadline or a date after completion.
@@ -139,8 +147,13 @@ def test_installment_options_for_no_deadline_and_shared_completion_date():
 def test_deadline_answer_filters_later_installments_and_why_users_are_evidence_based(monkeypatch):
     session, _ = start("Laptop costs 12k")
     blocks = session.handle("3")  # end of this month
-    assert any("No installment option completes by 2025-11-30" in block["text"] for block in blocks)
-    assert not any("Use installments?" in block["text"] for block in blocks)
+    # No installments chosen yet: no conflict message, the intake continues.
+    assert not any("No installment option completes by" in block["text"] for block in blocks)
+    assert "Is partial payment acceptable?" in blocks[-1]["text"]
+    blocks = session.handle("1")  # partial: no
+    assert "Use installments?" in blocks[-1]["text"]
+    blocks = session.handle("2")  # 3 months conflicts with the deadline
+    assert any("conflicts with the deadline" in block["text"] for block in blocks)
 
     demo = TerminalSession("user_07", "2025-11-04")
     assert demo.assistant.engine.get_user_home_currency("user_07") == "INR"

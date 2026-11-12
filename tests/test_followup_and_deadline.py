@@ -9,6 +9,11 @@ Bug 2: when no allowed installment plan completes by the kept deadline, the
 first flow's conflict question is asked instead of headlineing a late plan, and
 a report that still ends without a compliant option is NOT RECOMMENDED.
 
+Refinements: the conflict question only appears once installments are actually
+chosen (in the sentence or by answering "Use installments?"), the fallback
+alternative wording is accurate about earlier but disallowed options, and item
+extraction drops the relative pronoun ("laptop", not "laptop that").
+
 The fake dataset clones user_07's real financial events under synthetic users
 and omits ``income_classes.csv`` so no model call happens (same approach as
 ``tests/test_profile_honouring.py``).
@@ -215,3 +220,69 @@ def test_conflict_prompt_offers_full_payment_only_when_profile_allows(fake_datas
     assert session2.form["pay_by_date"] == "2024-09-20"  # the deadline is kept
     assert session2.form["allow_installments"] is False
     assert "PAY IN FULL TODAY" in blocks2[-1]["text"]
+
+
+def test_installments_not_mentioned_before_asking_when_not_chosen(fake_dataset):
+    # Deadline stated in the sentence, installments never chosen: the intake
+    # goes straight to its own questions and only mentions installments when
+    # it asks "Use installments?".
+    _assistant, session = _session(fake_dataset)
+    blocks = session.handle("Laptop 12k end of this month")
+    assert session.form["pay_by_date"] == "2024-09-30"
+    assert not any("installment" in block["text"].lower() for block in blocks)
+    blocks = session.handle("1")  # partial: no
+    assert "Use installments?" in blocks[-1]["text"]
+    blocks = session.handle("2")  # 3 months: finishes 2024-11-04, after the deadline
+    assert any("conflicts with the deadline 2024-09-30" in block["text"] for block in blocks)
+    blocks = session.handle("1")  # remove the deadline
+    assert session.form["pay_by_date"] is None
+    assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
+
+
+def test_deadline_question_answer_does_not_pre_filter_unchosen_installments(fake_dataset):
+    # Deadline answered as a question with no installments chosen: no
+    # "No installment option completes by..." message before asking.
+    _assistant, session = _session(fake_dataset)
+    session.handle("Laptop 12k")
+    blocks = session.handle("2")  # within 14 days -> 2024-09-19
+    assert not any("No installment option completes by" in block["text"] for block in blocks)
+    assert "Is partial payment acceptable?" in blocks[-1]["text"]
+    blocks = session.handle("1")  # partial: no
+    assert "Use installments?" in blocks[-1]["text"]
+    blocks = session.handle("2")  # 3 months conflicts with the deadline
+    assert any("conflicts with the deadline 2024-09-19" in block["text"] for block in blocks)
+    blocks = session.handle("1")  # remove the deadline
+    assert session.form["pay_by_date"] is None
+    assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
+
+
+def test_earlier_disallowed_safe_options_wording(fake_dataset):
+    # Paying in full today would finish earlier and stays safe, but the
+    # installments-only profile does not accept it: say so instead of claiming
+    # the chosen plan is the earliest safe way.
+    _assistant, session = _session(fake_dataset)
+    session.handle("Laptop 12k no deadline just advise")
+    alts = session.render_report(session.report).split("ALTERNATIVES\n", 1)[1].split("\n\nNEXT STEPS\n")[0]
+    assert "Earlier options exist but aren't among the payment methods you accept." in alts
+    assert "The selected plan is the earliest way" not in alts
+    full_option = next(option for option in session.report["ranked_options"]
+                       if option["type"] == "pay_in_full_now")
+    assert full_option["safe"] is True
+    assert max(full_option["dates"]) < max(session.report["recommended_option"]["dates"])
+
+    # When no earlier safe option exists the original wording stays accurate.
+    _assistant2, session2 = _session(fake_dataset)
+    session2.handle("Gadget 120k no deadline just advise")
+    alts2 = session2.render_report(session2.report).split("ALTERNATIVES\n", 1)[1].split("\n\nNEXT STEPS\n")[0]
+    assert "The selected plan is the earliest way to proceed safely without overdraft risk." in alts2
+    assert "Earlier options exist" not in alts2
+    assert not any(option["safe"] for option in session2.report["ranked_options"]
+                   if option["type"] != "installments")
+
+
+def test_item_extraction_drops_relative_pronoun(fake_dataset):
+    assert TerminalSession._request_item("Can I afford a laptop that costs 80000?") == "laptop"
+    assert TerminalSession._request_item("Can I afford a laptop that costs 80000? ") == "laptop"
+    _assistant, session = _session(fake_dataset)
+    blocks = session.handle("Can I afford a laptop that costs 80000?")
+    assert "Got it: INR 80,000.00 · laptop · no deadline given yet." == blocks[0]["text"]

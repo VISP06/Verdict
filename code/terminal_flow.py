@@ -321,9 +321,12 @@ class TerminalSession:
         self.question_index = 0
         if re.search(r"\bjust advise\b", lowered):
             self.questions = []
-        if self.form.get("pay_by_date") and not self._eligible_installment_counts() and "installments" in self.questions:
-            # No allowed installment plan completes by the deadline; ask the same
-            # conflict question as when a chosen count misses the deadline.
+        if (self.form.get("pay_by_date") and not self._eligible_installment_counts()
+                and "installments" in self.questions
+                and (self._installment_count_given or self._installment_count_only)):
+            # Only a request that actually chose installments (in the sentence)
+            # triggers the deadline-conflict question here; otherwise the
+            # installments question is simply asked later, unmentioned before.
             index = self.questions.index("installments")
             self.questions[index] = "deadline_conflict"
             self.form["installment_count"] = min(self.installment_counts)
@@ -351,7 +354,7 @@ class TerminalSession:
         else:
             item = re.sub(r"\b(?:can i|can we|should i|should we)\b", "", value, flags=re.I)
             item = re.sub(r"\b(?:buy|purchase|afford)\b", "", item, flags=re.I)
-            item = re.split(r"\b(?:worth|costing|costs?|by|i will|i'll|without|no installments?)\b", item, maxsplit=1, flags=re.I)[0]
+            item = re.split(r"\b(?:worth|costing|costs?|by|i will|i'll|without|no installments?|that)\b", item, maxsplit=1, flags=re.I)[0]
             item = re.sub(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|Rs\.?)\b)\s*", "", item, flags=re.I)
             item = re.sub(r"\b\d[\d,.]*(?:\s*(?:k|thousand|lakh|lakhs|lac|lacs|crore|crores))?\b", "", item, flags=re.I)
             item = re.sub(r"\b(?:no deadline|no due date|just advise|in full|pay in full|pay half now)\b", "", item, flags=re.I)
@@ -519,12 +522,25 @@ class TerminalSession:
             self._block("text", f"The selected installment plan conflicts with the deadline {self.form['pay_by_date']}.")
             self._prompt()
             return self.last_blocks
-        if key in {"deadline", "deadline_conflict"} and self.form.get("pay_by_date") and not self._eligible_installment_counts() and "installments" in self.questions[self.question_index:]:
+        if (key in {"deadline", "deadline_conflict"} and self.form.get("pay_by_date")
+                and not self._eligible_installment_counts()
+                and "installments" in self.questions[self.question_index:]
+                and (self._installment_count_given or self._installment_count_only)):
             index = self.questions.index("installments", self.question_index)
             self.questions[index] = "deadline_conflict"
             self.form["installment_count"] = min(self.installment_counts)
             self._conflict_reasks_installments = True
             blocks.append(self._block("text", self._installment_deadline_message(self.form["pay_by_date"])))
+        if key == "installments" and self._has_installment_conflict(self.form.get("pay_by_date")):
+            # The user has now actually chosen installments, so a count that
+            # cannot meet the kept deadline gets the same conflict question.
+            conflict_index = max(0, self.question_index - 1)
+            self.questions[conflict_index] = "deadline_conflict"
+            self.question_index = conflict_index
+            self._conflict_reasks_installments = False
+            self._block("text", f"The selected {self.form['installment_count']}-installment plan conflicts with the deadline {self.form['pay_by_date']}.")
+            self._prompt()
+            return self.last_blocks
         if self.question_index < len(self.questions):
             blocks.append(self._prompt())
             return blocks
@@ -658,7 +674,12 @@ class TerminalSession:
             if spending_changes != "none":
                 alts.append(f"Spending changes that would free cash: {spending_changes}.")
             if not alts:
-                alts.append("The selected plan is the earliest way to proceed safely without overdraft risk.")
+                earlier_safe = [x for x in options if x.get("safe") and x is not chosen
+                                and chosen and max(x["dates"]) < max(chosen["dates"])]
+                if earlier_safe:
+                    alts.append("Earlier options exist but aren't among the payment methods you accept.")
+                else:
+                    alts.append("The selected plan is the earliest way to proceed safely without overdraft risk.")
 
         if unmet_deadline:
             steps = [

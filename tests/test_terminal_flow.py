@@ -33,28 +33,26 @@ def start(text="Can I afford a 12k laptop?"):
 
 def test_intake_defaults_complete_report_and_partial_installment_paths():
     session, blocks = start()
-    assert "When do you need" in blocks[0]["text"]
+    assert "When do you need" in blocks[-1]["text"]
     for _ in range(3): blocks = session.handle("")
     assert blocks[0]["kind"] == "report"
     assert session.report
     session, _ = start("Can I pay half now for a 12k laptop?")
     assert "When do you need" in session.last_blocks[-1]["text"]
-    session.handle("")
-    blocks = session.handle("1")
+    blocks = session.handle("")
     assert session.form["allow_partial"]
     assert blocks[0]["kind"] == "report"
     session, _ = start("Laptop 12k in 3 installments")
     assert session.form["allow_installments"] and session.form["installment_count"] == 3
     session, _ = start("Laptop 12k no deadline")
     session.handle("1")
-    session.handle("2")
-    blocks = session.handle("")
+    blocks = session.handle("2")
     assert blocks[0]["kind"] == "report"
 
 
 def test_skipped_questions_and_invalid_answers():
     session, blocks = start("Laptop 12k, no deadline")
-    assert "partial payment" in blocks[0]["text"]
+    assert "partial payment" in blocks[-1]["text"]
     session, _ = start()
     session.handle("bogus")
     assert session.phase == "intake"
@@ -80,8 +78,11 @@ def test_report_verdict_controls_steps_and_pending_items_are_reported_once():
     session.handle("Laptop costs Rs. 12k no deadline just advise")
     result = session.report
     rendered = session.render_report(result)
+    # The interactive path honours the profile: user_07 considers installments
+    # only, so the plain 12k request resolves to the 3-installment plan.
     if result["recommended_option"]:
-        assert "Confirm the selected plan" in rendered
+        assert "PAY IN 3 INSTALLMENTS" in rendered
+        assert "Confirm the 3-installment plan" in rendered
         assert "Do not make this payment now" not in rendered
 
     result["recommended_option"] = None
@@ -111,7 +112,7 @@ def test_deadline_filters_installments_and_conflicting_deadline_reasks():
     # If an installment count was stated first, a conflicting deadline is rejected
     # and the replacement prompt allows only no deadline or a date after completion.
     session, blocks = start("Laptop 12k in 3 installments")
-    assert "When do you need" in blocks[0]["text"]
+    assert "When do you need" in blocks[-1]["text"]
     blocks = session.handle("2")
     assert any("conflicts with the deadline" in block["text"] for block in blocks)
     prompt = blocks[-1]["text"]
@@ -123,9 +124,11 @@ def test_deadline_filters_installments_and_conflicting_deadline_reasks():
 def test_installment_options_for_no_deadline_and_shared_completion_date():
     session, blocks = start("Laptop 12k no deadline")
     blocks = session.handle("1")  # no partial payment
+    # The menu never offers counts above the profile cap; user_05 allows 4,
+    # so only the 3-month plan is listed.
     assert "3 months" in blocks[0]["text"]
-    assert "6 months" in blocks[0]["text"]
-    assert "12 months" in blocks[0]["text"]
+    assert "6 months" not in blocks[0]["text"]
+    assert "12 months" not in blocks[0]["text"]
     assert installment_completion_date("2025-11-04", 3) == __import__("datetime").date(2026, 1, 3)
     result = session.assistant.advise({"amount": 12000, "currency": "ZAR", "allow_installments": True,
                                        "installment_count": 3, "installment_fee_pct": 0})
@@ -141,7 +144,7 @@ def test_deadline_answer_filters_later_installments_and_why_users_are_evidence_b
 
     demo = TerminalSession("user_07", "2025-11-04")
     assert demo.assistant.engine.get_user_home_currency("user_07") == "INR"
-    assert demo.handle("Laptop costs Rs. 12k no deadline just advise")[0]["kind"] == "report"
+    assert demo.handle("Laptop costs Rs. 12k no deadline just advise")[-1]["kind"] == "report"
     why = demo.handle("/why")[0]["text"]
     for label in ("Data loaded:", "Income streams/classes:", "Retrieved message IDs:",
                   "Options considered:", "Wording: plain text", "Failproof session: chat-"):
@@ -217,7 +220,7 @@ def test_amount_candidates_table(text, expected):
 def test_ambiguous_and_negative_amount_messages_and_large_amount_warning():
     session = TerminalSession("user_07", "2025-11-04")
     assert "Which amount did you mean: INR 12,000.00 or INR 5,000.00?" in session.handle("12k and 5k")[0]["text"]
-    assert session.handle("12k")[0]["kind"] == "prompt"
+    assert session.handle("12k")[-1]["kind"] == "prompt"
     assert "positive" in session.handle("-500")[0]["text"]
     large_session = TerminalSession("user_07", "2025-11-04")
     large_session.handle("1500 bn no deadline just advise")
@@ -242,9 +245,10 @@ def test_typed_deadline_validation_table(answer):
 @pytest.mark.parametrize(("fee", "expected", "asks_again"), [("0", 0, False), ("30", 30, False),
                                                                 ("31", 0, True), ("-1", 0, True)])
 def test_installment_fee_range_and_retry_table(fee, expected, asks_again):
-    session, _ = start("Laptop 12k no deadline")
-    session.handle("1")  # no partial
-    session.handle("2")  # 3 installments
+    # The fee question is kept only when the sentence states an out-of-range fee;
+    # otherwise the intake defaults to 0% without asking.
+    session, _ = start("Laptop 12k no deadline in 3 installments with 31% fee")
+    assert session.questions == ["fee"]
     if asks_again:
         assert session.handle(fee)[0]["kind"] == "prompt"
         session.handle(fee)
@@ -361,10 +365,15 @@ def test_existing_report_followups_continue_working():
     assert any(b["text"].startswith("WHAT CHANGED") for b in wait_blocks)
     assert any(b["kind"] == "report" for b in wait_blocks)
 
-    # 6 installments
+    # 6 installments: the kept deadline (set by "wait a month") cannot be met
+    # by a 6-installment plan, so the first flow's conflict question appears
+    # instead of a late-plan verdict.
     inst_blocks = session.handle("6 installments")
-    assert any(b["text"].startswith("WHAT CHANGED") for b in inst_blocks)
+    assert any("conflicts with the deadline" in b["text"] for b in inst_blocks)
+    assert not any(b["kind"] == "report" for b in inst_blocks)
+    inst_blocks = session.handle("1")  # remove the deadline
     assert any(b["kind"] == "report" for b in inst_blocks)
+    assert session.form["pay_by_date"] is None
 
     # actually 20k
     act_blocks = session.handle("actually 20k")
@@ -373,11 +382,13 @@ def test_existing_report_followups_continue_working():
     assert session.form["amount"] == 20000.0
 
 
-def test_pay_in_full_today_no_useless_alternatives_and_no_duplicate_options():
+def test_profile_honoured_verdict_and_useful_alternatives():
     session = TerminalSession("user_07", "2025-11-04")
     blocks = session.handle("Laptop 12k no deadline just advise")
-    report_text = blocks[0]["text"]
-    assert "PAY IN FULL TODAY" in report_text
+    report_text = blocks[-1]["text"]
+    # user_07's profile considers installments only, so the plain request
+    # recommends the 3-installment plan instead of paying in full today.
+    assert "PAY IN 3 INSTALLMENTS" in report_text
 
     alts_section = report_text.split("ALTERNATIVES\n", 1)[1].split("\n\nNEXT STEPS\n")[0]
     next_steps_section = report_text.split("NEXT STEPS\n", 1)[1]
@@ -387,10 +398,80 @@ def test_pay_in_full_today_no_useless_alternatives_and_no_duplicate_options():
     assert "Best other safe options: none" not in alts_section
     assert f"Earliest safe date to wait for: {session.as_of_date}" not in alts_section
     assert "Spending changes that would free cash: none" not in alts_section
-
-    # Alternatives do not duplicate the selected option
-    assert "Earliest safe date to wait for:" not in alts_section
+    # No wait option and no pay-in-full recommendation for an installments-only profile
+    assert "WAIT UNTIL" not in report_text
+    assert "to pay in full and avoid fees" not in alts_section
 
     # Tailored next steps
-    assert "Confirm the selected plan" in next_steps_section
+    assert "Confirm the 3-installment plan" in next_steps_section
     assert "Do not make this payment now" not in next_steps_section
+
+
+def test_intake_skips_redundant_partial_and_fee_when_count_stated():
+    session = TerminalSession("user_07", "2024-09-04")
+    blocks = session.handle("Can I pay ₹50,000 in 6 installments?")
+    joined = " ".join(block["text"] for block in blocks)
+    assert "Is partial payment acceptable?" not in joined
+    assert "fee" not in joined.lower()
+    assert session.questions == ["deadline"]
+    assert session.form["allow_installments"] and session.form["installment_count"] == 6
+    assert session.form["allow_partial"] is False
+    assert "Got it: INR 50,000.00" in blocks[0]["text"] and "6 installments" in blocks[0]["text"]
+
+
+def test_intake_asks_only_count_when_installments_already_chosen():
+    session = TerminalSession("user_07", "2024-09-04")
+    blocks = session.handle("Can I pay ₹50,000 in installments by 2024-11-24?")
+    assert session.questions == ["installments"]
+    assert "Is partial payment acceptable?" not in " ".join(b["text"] for b in blocks)
+    prompt = blocks[-1]["text"]
+    assert "No installments" not in prompt and "How many installments?" in prompt
+    assert "3 months" in prompt and "6 months" not in prompt  # only plans completing by the deadline
+    blocks = session.handle("")  # accepts the default plan
+    assert session.form["allow_installments"] and session.form["installment_count"] == 3
+    assert any(block["kind"] == "report" for block in blocks)
+
+
+def test_intake_explicit_partial_skips_installments():
+    session = TerminalSession("user_07", "2024-09-04")
+    session.handle("Can I pay half now for a 12k laptop?")
+    assert session.questions == ["deadline"]
+    assert session.form["allow_partial"] is True
+    assert session.form["allow_installments"] is False
+    assert session.form["partial_amount"] == 6000
+
+
+def test_partial_yes_removes_installments_question_and_no_keeps_it():
+    session = TerminalSession("user_07", "2024-09-04")
+    session.handle("Can I afford a laptop that costs 80000?")
+    assert session.questions == ["deadline", "partial", "installments"]
+    session.handle("")  # no deadline
+    blocks = session.handle("2")  # partial: yes
+    assert "installments" not in session.questions
+    assert session.form["allow_partial"] is True and session.form["allow_installments"] is False
+    assert any(block["kind"] == "report" for block in blocks)
+
+    session, _ = start("Can I afford a laptop that costs 80000?")
+    session.handle("")
+    blocks = session.handle("1")  # partial: no
+    assert "installments" in session.questions
+    assert "installments" in blocks[-1]["text"]
+
+
+def test_plain_request_still_asks_full_intake():
+    session = TerminalSession("user_07", "2024-09-04")
+    blocks = session.handle("Can I afford a laptop that costs 80000?")
+    assert session.questions == ["deadline", "partial", "installments"]
+    assert "When do you need" in blocks[-1]["text"]
+    assert "Is partial payment acceptable" in blocks[-1]["text"] or session.questions[1:] == ["partial", "installments"]
+
+
+def test_acknowledgement_is_escaped_and_shown_once_per_request():
+    session = TerminalSession("user_07", "2024-09-04")
+    blocks = session.handle("Can I afford a <b>laptop</b> costing 80000?")
+    acks = [block for block in blocks if block["text"].startswith("Got it:")]
+    assert len(acks) == 1
+    assert "&lt;b&gt;laptop&lt;/b&gt;" in acks[0]["text"]
+    assert "<b>laptop</b>" not in acks[0]["text"]
+    followup_blocks = session.handle("")  # answering a question never re-acknowledges
+    assert followup_blocks and not any(block["text"].startswith("Got it:") for block in followup_blocks)

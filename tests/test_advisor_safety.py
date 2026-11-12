@@ -62,6 +62,12 @@ def test_rich_user_full_payment_does_not_create_degenerate_partial_plan():
     form = {"amount": 12000, "currency": "INR", "pay_by_date": "2025-11-17",
             "allow_partial": True, "allow_installments": False}
     result, report = _advise("user_07", "2025-11-03", form)
-    assert report.splitlines()[0].startswith("╭─ PAY IN FULL TODAY")
-    assert result["recommended_option"]["type"] == "pay_in_full_now"
+    # The interactive path honours the profile: user_07 considers installments
+    # only, so the request resolves to the 3-installment plan (synthesized
+    # default terms), never to a degenerate partial plan. No installment plan
+    # completes by the 2025-11-17 deadline, so the verdict must not headline
+    # the late plan.
+    assert report.splitlines()[0].startswith("╭─ NOT RECOMMENDED: no allowed plan completes by 2025-11-17")
+    assert result["recommended_option"]["type"] == "installments"
+    assert result["recommended_option"]["meets_deadline"] is False
     assert not any(option["type"] == "partial_then_remainder" for option in result["ranked_options"])

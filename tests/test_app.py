@@ -130,6 +130,9 @@ def test_full_conversation_with_clicks_only_and_choice_echoed(monkeypatch):
     _click(at, "No, pay it in full")
     _click(at, "No installments")
     html = "\n".join(x.value for x in at.markdown)
-    assert "PAY IN FULL TODAY" in html
+    # The interactive path honours the profile: user_07 considers installments
+    # only, so declining installments leaves no method the profile allows and
+    # the deterministic report is NOT RECOMMENDED.
+    assert "NOT RECOMMENDED" in html
     assert "No deadline" in html and "No installments" in html  # choices echoed by label, not key
     assert "\u276f 1<" not in html

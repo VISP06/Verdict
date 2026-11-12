@@ -18,7 +18,7 @@ from explain_llm import validate_polish
 from financial_engine import FinancialEngine
 from forecast import FORECAST_CONFIG
 from income_classifier import IncomeClassifier
-from main import decide_request
+from main import decide_request, format_payment_plan
 from observability import logged_completion, new_run_id
 from plan_dates import installment_completion_date
 from retrieval import retrieve_messages
@@ -227,6 +227,44 @@ class Assistant:
         except ValueError:
             return None, home_currency
 
+    def _profile_allowed_methods(self):
+        """Payment methods the user's profile says they would consider."""
+        profile = self.engine.profiles.loc[self.user_id]
+        raw = profile.get("payment_methods_user_will_consider", "")
+        if pd.isna(raw):
+            raw = ""
+        allowed = {item.strip().lower() for item in str(raw).split("|") if item.strip()}
+        return allowed or {"full_payment"}
+
+    def _max_installment_months(self):
+        """Installment-count cap from the user's profile, or None when unrestricted."""
+        profile = self.engine.profiles.loc[self.user_id]
+        value = profile.get("max_installment_months")
+        if value is None or pd.isna(value):
+            return None
+        try:
+            cap = int(value)
+        except (TypeError, ValueError):
+            return None
+        return cap if cap > 0 else None
+
+    def _considered_methods(self, intent):
+        """Methods to evaluate: explicit requests narrow the profile, never widen it."""
+        allowed = self._profile_allowed_methods()
+        requested = {"full_payment"}
+        if intent.get("allows_partial_payment"):
+            requested.add("partial_payment")
+        terms = intent.get("installment_terms")
+        if terms and terms.get("count") and terms.get("interval_days") is not None:
+            requested.add("installments")
+        declined = {str(item).strip().lower() for item in (intent.get("declined_methods") or [])}
+        narrowed = requested & allowed
+        if narrowed:
+            return narrowed
+        if declined & allowed:
+            return set()
+        return set(allowed)
+
     def run_decision(self, intent):
         """Build an ad-hoc request, run deterministic decision logic and return its evidence."""
         home_amount, home_currency = self._home_amount(intent["amount"], intent["currency"])
@@ -236,11 +274,7 @@ class Assistant:
         request_id = f"chat_{self.run_id}"
         partial = bool(intent["allows_partial_payment"])
         terms = intent.get("installment_terms")
-        methods = ["full_payment"]
-        if partial:
-            methods.append("partial_payment")
-        if terms and terms.get("count") and terms.get("interval_days") is not None:
-            methods.append("installments")
+        methods = sorted(self._considered_methods(intent))
         row = {
             "request_id": request_id, "user_id": self.user_id,
             "request_date": self.as_of_date, "request_type": "other",
@@ -421,15 +455,31 @@ class Assistant:
     def _intent_from_form(self, form):
         home = self.engine.get_user_home_currency(self.user_id)
         date_value = form.get("pay_by_date")
-        terms = None
+        cap = self._max_installment_months()
         if form.get("allow_installments"):
-            terms = {"count": int(form.get("installment_count", 3)), "interval_days": 30,
+            count = int(form.get("installment_count") or 3)
+            if cap:
+                count = min(count, cap)
+            terms = {"count": count, "interval_days": 30,
                      "fee": float(form.get("installment_fee_pct", 0)) * float(form.get("amount", 0) or 0) / 100}
+        elif "installments" in self._profile_allowed_methods() and not form.get("installments_declined"):
+            # The profile makes installments the (or a) considered method but the
+            # form carries no explicit terms; use the profile-capped default plan
+            # so the engine can still evaluate the method the user considers.
+            terms = {"count": min(3, cap) if cap else 3, "interval_days": 30, "fee": 0.0}
+        else:
+            terms = None
+        declined = []
+        if form.get("partial_declined"):
+            declined.append("partial_payment")
+        if form.get("installments_declined"):
+            declined.append("installments")
         return {"intent": "affordability", "item": form.get("item") or "payment",
                 "amount": form.get("amount"), "currency": form.get("currency") or home,
                 "desired_date": date_value.isoformat() if hasattr(date_value, "isoformat") else date_value,
                 "allows_partial_payment": bool(form.get("allow_partial", False)),
                 "installment_terms": terms,
+                "declined_methods": declined,
                 "initial_fraction": (float(form["partial_amount"]) / float(form["amount"])
                                      if form.get("partial_amount") is not None and float(form.get("amount") or 0) > 0
                                      else None), "missing_fields": []}
@@ -563,7 +613,9 @@ class Assistant:
                 day = (completion - timedelta(days=interval_days * (count - idx - 1))).isoformat()
                 plan.append((day, (amount+fee)/count))
             add("installments", plan, amount+fee, intended_total=amount+fee)
-        if earliest and earliest > self.as_of_date:
+        considered = self._considered_methods(intent)
+        # A wait option is only meaningful for users who accept paying in full.
+        if "full_payment" in considered and earliest and earliest > self.as_of_date:
             add("wait", [(earliest, amount)], intended_total=amount)
         # Preserve all requested alternatives even when their projected schedule is unsafe.
         safe = sorted((x for x in scenarios if x["safe"]), key=lambda x: (
@@ -585,28 +637,67 @@ class Assistant:
         evidence_ids = sorted(set(all_flow_ids)
                               | set(map(str, evidence.get("retrieved_message_ids", [])))
                               | set(map(str, breakdown.get("pending_ignored", []))))
-        monthly_incomes = exp.get("income_counted", [])
+        monthly_incomes = [
+            # explain.py reports 90-day window totals; the advisory report (like
+            # situation()) expresses counted income per month, one third of the
+            # three-month window.
+            {**item, "amount": round(float(item.get("amount", 0)) / 3, 2)}
+            for item in exp.get("income_counted", [])
+        ]
         engine_status = str(decision["row"].get("affordability_status", ""))
         engine_method = str(decision["row"].get("recommended_payment_method", ""))
         method_options = {"full_payment": "pay_in_full_now", "partial_payment": "partial_then_remainder",
                           "installments": "installments", "wait": "wait"}
+        type_methods = {value: key for key, value in method_options.items()}
         engine_option_type = method_options.get(engine_method)
         engine_scenario = next((item for item in safe if item["type"] == engine_option_type), None)
-        mismatch = ((engine_status == "not_affordable" and bool(safe))
-                    or (engine_status != "not_affordable" and not engine_scenario)
-                    or (engine_status != "not_affordable" and chosen is not None
-                        and engine_scenario is not None and chosen["type"] != engine_scenario["type"]))
-        if mismatch:
+
+        def plan_key(plan):
+            return tuple(sorted((str(day), round(float(value), 2)) for day, value in plan.items()))
+
+        # Engine candidates are the plans it actually evaluated; an identical
+        # advisor scenario is refuted when the engine already ruled on it.
+        evaluated = {(str(item.get("method")), plan_key(item.get("plan_dict") or {}))
+                     for item in evidence.get("candidates", []) or []}
+        eligible_types = {method_options[m] for m in considered if m in method_options}
+        pool = [item for item in safe
+                if item["type"] in eligible_types
+                and (type_methods.get(item["type"]), plan_key(item["dates"])) not in evaluated]
+        fallback = pool[0] if pool else None
+        row = decision["row"]
+        if engine_status == "not_affordable" and fallback is not None:
+            # The engine dropped every plan (typically an installment schedule
+            # finishing beyond the 90-day horizon) although a safe scenario exists
+            # among the methods the user would consider; follow the advisor and
+            # correct the deterministic row so the report stays consistent.
             fp.event.error(session_id=self.session_id, agent_id="assistant",
-                           error_type="AdvisorEngineMismatch",
-                           message=(f"Engine status/method {engine_status}/{engine_method} disagreed "
-                                    f"with safe advisor scenarios {[item['type'] for item in safe]}; following the engine."))
-        if engine_status == "not_affordable":
-            chosen = None
-        elif engine_scenario is not None:
-            chosen = engine_scenario
+                           error_type="AdvisorEngineFallback",
+                           message=(f"Engine returned no candidate (considered methods {sorted(considered)}); "
+                                    f"using safe advisor scenario {fallback['type']} "
+                                    f"with dates {sorted(fallback['dates'])}."))
+            row["affordability_status"] = {"pay_in_full_now": "affordable_now",
+                                           "partial_then_remainder": "affordable_with_plan",
+                                           "installments": "affordable_with_plan",
+                                           "wait": "affordable_later"}[fallback["type"]]
+            row["recommended_payment_method"] = type_methods[fallback["type"]]
+            row["payment_plan"] = format_payment_plan(fallback["dates"])
+            chosen = fallback
         else:
-            chosen = None
+            mismatch = ((engine_status == "not_affordable" and bool(safe))
+                        or (engine_status != "not_affordable" and not engine_scenario)
+                        or (engine_status != "not_affordable" and chosen is not None
+                            and engine_scenario is not None and chosen["type"] != engine_scenario["type"]))
+            if mismatch:
+                fp.event.error(session_id=self.session_id, agent_id="assistant",
+                               error_type="AdvisorEngineMismatch",
+                               message=(f"Engine status/method {engine_status}/{engine_method} disagreed "
+                                        f"with safe advisor scenarios {[item['type'] for item in safe]}; following the engine."))
+            if engine_status == "not_affordable":
+                chosen = None
+            elif engine_scenario is not None:
+                chosen = engine_scenario
+            else:
+                chosen = None
         income_stream_classes = [{"series_key": str(key[2]), "class": str(value.get("class", "unknown")),
                                   "reason": str(value.get("reason", ""))}
                                  for key, value in classes.items() if len(key) >= 3

@@ -2,6 +2,7 @@
 
 import datetime as dt
 import calendar
+import html
 import os
 import re
 
@@ -79,6 +80,32 @@ def parse_amount(text):
     return None, currency
 
 
+_FOLLOWUP_COUNT_PATTERNS = (
+    re.compile(r"\b(\d+)\s*installments?\b"),
+    re.compile(r"\binstallments?\b[^.?!]*?\b(?:to|be|into)\s+(\d+)\b"),
+    re.compile(r"\buse\s+(\d+)\s+instead\b"),
+    re.compile(r"\bsplit\s+(?:it\s+)?into\s+(\d+)\b"),
+)
+_PURCHASE_CUE_RE = re.compile(r"\b(?:pay|paying|afford|cost|costs|buy|buying|purchase)\b")
+_CURRENCY_RE = re.compile(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|rs\.?)\b|(?<!\w)R(?=\s*\d))", re.I)
+
+
+def _followup_count(low):
+    """Installment count stated by an amendment such as 'make it 3 installments'."""
+    for pattern in _FOLLOWUP_COUNT_PATTERNS:
+        match = pattern.search(low)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _is_installment_count_followup(low):
+    """True when the sentence only amends the installment count of the prior request."""
+    return (_followup_count(low) is not None
+            and not _PURCHASE_CUE_RE.search(low)
+            and not _CURRENCY_RE.search(low))
+
+
 def _amount_candidates(text):
     """Extract distinct amounts so ambiguous requests can be clarified."""
     value = str(text or "")
@@ -123,13 +150,20 @@ class TerminalSession:
         self.latest_result = None
         self.latest_wording = "plain text"
         self.last_blocks = []
+        self._installment_count_given = False
+        self._installment_count_only = False
+        self._conflict_reasks_installments = False
 
     def _earliest_installment_completion(self):
         return installment_completion_date(self.as_of_date, min(self.installment_counts))
 
     @property
     def installment_counts(self):
-        return (3, 6, 12)
+        cap = self.assistant._max_installment_months()
+        counts = [count for count in (3, 6, 12) if cap is None or count <= cap]
+        if not counts:
+            counts = [cap]
+        return tuple(counts)
 
     def _eligible_installment_counts(self):
         deadline = self.form.get("pay_by_date")
@@ -140,8 +174,10 @@ class TerminalSession:
 
     def _installment_options_text(self):
         counts = self._eligible_installment_counts()
-        if not self.form.get("pay_by_date"):
+        if not counts:
             counts = list(self.installment_counts)
+        if getattr(self, "_installment_count_only", False):
+            return "1 {} months (default)".format(counts[0]) + "".join(f", {idx + 2} {count} months" for idx, count in enumerate(counts[1:]))
         return "1 no (default)" + "".join(f", {idx + 2} {count} months" for idx, count in enumerate(counts))
 
     def _installment_deadline_message(self, deadline):
@@ -150,7 +186,7 @@ class TerminalSession:
                 f"on {earliest}, after the deadline.")
 
     def _has_installment_conflict(self, deadline):
-        count = self.form.get("installment_count") if self.form.get("allow_installments") else None
+        count = self.form.get("installment_count") if (self.form.get("allow_installments") and getattr(self, "_installment_count_given", False)) else None
         return bool(count and deadline and installment_completion_date(self.as_of_date, count) > dt.date.fromisoformat(str(deadline)[:10]))
 
     def _latest_date(self, user_id):
@@ -166,35 +202,43 @@ class TerminalSession:
 
     def _prompt(self):
         question = self.questions[self.question_index]
-        options = {
-            "deadline": "When do you need to pay? [1 none (default), 2 within 14 days, 3 end of this month, 4 type YYYY-MM-DD]",
-            "partial": "Is partial payment acceptable? [1 no (default), 2 yes]",
-            "installments": f"Use installments? [{self._installment_options_text()}]",
-            "fee": "Optional installment fee percentage? [Enter for 0%]",
-        }
+        count_only = question == "installments" and getattr(self, "_installment_count_only", False)
         if question == "deadline_conflict":
             earliest = installment_completion_date(self.as_of_date, self.form["installment_count"])
             text = f"The selected installment plan ends {earliest}, after that deadline. Choose 1 none, or type a date on or after {earliest}."
             low = earliest if isinstance(earliest, str) else earliest.isoformat()
             high = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
+            options = [{"key": "1", "label": "Remove the deadline", "default": True}]
+            if "full_payment" in self.assistant._profile_allowed_methods():
+                options.append({"key": "2", "label": "Pay in full today instead", "default": False})
             return self._block("prompt", text, {"question": f"That installment plan would finish on {low}, after your deadline. What would you like to do?",
-                                                "options": [{"key": "1", "label": "Remove the deadline", "default": True}],
+                                                "options": options,
                                                 "picker": {"label": "Or choose a later date", "min": low, "max": max(low, high)}})
         if question == "date":
             text = "Type a date in YYYY-MM-DD format."
             low = self.as_of_date
             high = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
             return self._block("prompt", text, {"question": "Which date do you need to pay by?", "options": [], "picker": {"label": "Choose a date", "min": low, "max": high}})
+        options = {
+            "deadline": "When do you need to pay? [1 none (default), 2 within 14 days, 3 end of this month, 4 type YYYY-MM-DD]",
+            "partial": "Is partial payment acceptable? [1 no (default), 2 yes]",
+            "installments": f"{'How many installments?' if count_only else 'Use installments?'} [{self._installment_options_text()}]",
+            "fee": "Optional installment fee percentage? [Enter for 0%]",
+        }
         text = options[question]
         clean_questions = {"deadline": "When do you need to pay?", "partial": "Is partial payment acceptable?",
-                           "installments": "Would you like to pay in installments?", "fee": "Is there a fee for installments?"}
+                           "installments": "How many installments?" if count_only else "Would you like to pay in installments?",
+                           "fee": "Is there a fee for installments?"}
         if question == "deadline": choices = [("1", "No deadline", True), ("2", "Within 14 days", False), ("3", "By the end of this month", False), ("4", "Pick a date…", False)]
         elif question == "partial": choices = [("1", "No, pay it in full", True), ("2", "Yes, part now and the rest later", False)]
         elif question == "installments":
             counts = self._eligible_installment_counts()
-            if not self.form.get("pay_by_date"):
+            if not counts:
                 counts = list(self.installment_counts)
-            choices = [("1", "No installments", True)] + [(str(idx + 2), f"{count} monthly payments", False) for idx, count in enumerate(counts)]
+            if getattr(self, "_installment_count_only", False):
+                choices = [(str(idx + 1), f"{count} monthly payments", idx == 0) for idx, count in enumerate(counts)]
+            else:
+                choices = [("1", "No installments", True)] + [(str(idx + 2), f"{count} monthly payments", False) for idx, count in enumerate(counts)]
         else: choices = [(str(value), "No fee" if value == 0 else f"{value}% fee", value == 0) for value in (0, 1, 2, 5)]
         return self._block("prompt", text, {"question": clean_questions.get(question, text), "options": [{"key": k, "label": label, "default": default} for k, label, default in choices]})
 
@@ -224,28 +268,50 @@ class TerminalSession:
                      "installment_count": 3, "installment_fee_pct": 0.0}
         lowered = line.lower()
         self.questions = []
+        self._installment_count_given = False
+        self._installment_count_only = False
         if not self._parse_deadline(line):
             self.questions.append("deadline")
-        if re.search(r"pay half now|partial payment", lowered):
+        partial = re.search(r"pay half now|partial payment|part now", lowered)
+        count = re.search(r"\b(\d+)\s+installments?\b", lowered)
+        declined = re.search(r"\b(?:no installments?|without (?:any )?installments?|without installments?)\b", lowered)
+        chosen = bool(count) or bool(not declined and re.search(r"\b(?:installments?|instalments?)\b|\bin\s+parts\b", lowered))
+        fee_match = re.search(r"(\d+(?:\.\d+)?)\s*%", lowered)
+        if re.search(r"\b(no partial|pay in full|full payment only|in full)\b", lowered):
+            self.form["partial_declined"] = True
+        if partial and not chosen:
             self.form["allow_partial"] = True
+            self.form["allow_installments"] = False
             if "pay half now" in lowered:
                 self.form["partial_amount"] = amount * 0.5
-        elif not re.search(r"\b(no partial|pay in full|full payment only|in full)\b", lowered):
+        elif not re.search(r"\b(no partial|pay in full|full payment only|in full)\b", lowered) and not chosen:
             self.questions.append("partial")
-        count = re.search(r"\b(\d+)\s+installments?\b", lowered)
         if count:
-            self.form.update(allow_installments=True, installment_count=int(count.group(1)))
-            fee_match = re.search(r"(\d+(?:\.\d+)?)\s*%", lowered)
+            self.form.update(allow_installments=True, installment_count=int(count.group(1)),
+                             allow_partial=False)
+            self._installment_count_given = True
+            cap = self.assistant._max_installment_months()
+            if cap and self.form["installment_count"] > cap:
+                self.form["installment_count"] = cap
+                self._block("text", f"Your profile allows at most {cap} installments; using {cap}.")
             if fee_match:
                 fee = float(fee_match.group(1))
                 if 0 <= fee <= 30: self.form["installment_fee_pct"] = fee
                 else: self.questions.append("fee")
-            else:
-                self.questions.append("fee")
-        elif re.search(r"\b(?:no installments?|without (?:any )?installments?|without installments?)\b", lowered):
+        elif declined:
             self.form["allow_installments"] = False
+            self.form["installments_declined"] = True
+        elif chosen:
+            self.form.update(allow_installments=True, allow_partial=False)
+            self._installment_count_only = True
+            self.questions.append("installments")
+            if fee_match and not (0 <= float(fee_match.group(1)) <= 30):
+                self.questions.append("fee")
+        elif partial:
+            pass  # explicit partial request excludes the installment plan entirely
         else:
             self.questions.append("installments")
+        self._acknowledge(lowered)
         if self.form.get("allow_installments") and self.form.get("pay_by_date") and self._has_installment_conflict(self.form["pay_by_date"]):
             deadline = self.form["pay_by_date"]
             self.questions = [q for q in self.questions if q != "deadline"]
@@ -256,7 +322,12 @@ class TerminalSession:
         if re.search(r"\bjust advise\b", lowered):
             self.questions = []
         if self.form.get("pay_by_date") and not self._eligible_installment_counts() and "installments" in self.questions:
-            self.questions.remove("installments")
+            # No allowed installment plan completes by the deadline; ask the same
+            # conflict question as when a chosen count misses the deadline.
+            index = self.questions.index("installments")
+            self.questions[index] = "deadline_conflict"
+            self.form["installment_count"] = min(self.installment_counts)
+            self._conflict_reasks_installments = True
             self._block("text", self._installment_deadline_message(self.form["pay_by_date"]))
         if amount > 1_000_000_000_000:
             self._block("text", "Warning: that amount is above 1,000,000,000,000; please check it carefully.")
@@ -322,15 +393,44 @@ class TerminalSession:
             return True
         return False
 
+    def _acknowledge(self, lowered):
+        """One short acknowledgement per new request, built only from parsed fields."""
+        parts = [f"Got it: {money(self.form['amount'], self.form['currency'])}"]
+        item = str(self.form.get("item") or "")
+        if item and item != "payment" and "installments" not in item:
+            parts.append(html.escape(item, quote=True))
+        if self.form.get("allow_installments") and self._installment_count_given:
+            parts.append(f"{int(self.form['installment_count'])} installments")
+            if self.form.get("installment_fee_pct"):
+                parts.append(f"{self.form['installment_fee_pct']:g}% fee")
+        elif self.form.get("allow_installments"):
+            parts.append("installments")
+        elif self.form.get("allow_partial"):
+            parts.append("half now" if self.form.get("partial_amount") else "partial payment")
+        if self.form.get("pay_by_date"):
+            parts.append(f"pay by {self.form['pay_by_date']}")
+        elif re.search(r"\b(?:no deadline|no due date|just advise)\b", lowered):
+            parts.append("no deadline")
+        else:
+            parts.append("no deadline given yet")
+        self._block("text", " · ".join(parts) + ".")
+
     def _accept_answer(self, line):
         key = self.questions[self.question_index]
         value = line.strip()
-        dynamic_counts = self._eligible_installment_counts()
+        dynamic_counts = self._eligible_installment_counts() or list(self.installment_counts)
         installment_choices = {str(idx + 2): count for idx, count in enumerate(dynamic_counts)}
+        count_only = key == "installments" and getattr(self, "_installment_count_only", False)
+        if count_only:
+            installment_choices = {str(idx + 1): count for idx, count in enumerate(dynamic_counts)}
+        conflict_choices = {"1": None}
+        if "full_payment" in self.assistant._profile_allowed_methods():
+            conflict_choices["2"] = "full"
         choices = {"deadline": {"1": None, "2": "14", "3": "month", "4": "date"},
-                   "deadline_conflict": {"1": None}, "partial": {"1": False, "2": True},
-                   "installments": {"1": False, **installment_choices}}
-        is_date = key == "date" or (key == "deadline_conflict" and value not in {"", "1"})
+                   "deadline_conflict": conflict_choices, "partial": {"1": False, "2": True},
+                   "installments": (installment_choices if count_only else {"1": False, **installment_choices})}
+        is_date = key == "date" or (key == "deadline_conflict" and value not in {"", "1"}
+                                    and not (value == "2" and "2" in conflict_choices))
         valid = value == "" or (key in choices and value in choices[key]) or (key == "fee" and bool(re.fullmatch(r"\d+(?:\.\d+)?", value)) and 0 <= float(value) <= 30)
         relative_value = re.fullmatch(r"in\s+(\d+)\s+(days?|weeks?)", value, re.I)
         if relative_value and key in {"date", "deadline_conflict"}:
@@ -358,7 +458,18 @@ class TerminalSession:
             value = ""
         self.invalid_attempts = 0
         if key in {"deadline", "deadline_conflict"}:
-            if value == "2":
+            if key == "deadline_conflict":
+                if value in {"", "1"}:
+                    self.form["pay_by_date"] = None
+                elif value == "2":
+                    # The user takes the option that meets the deadline: pay in
+                    # full today. The kept deadline stays untouched.
+                    self.form["allow_installments"] = False
+                    self.form["installments_declined"] = True
+                    self._installment_count_only = False
+                else:
+                    self.form["pay_by_date"] = dt.date.fromisoformat(value).isoformat()
+            elif value == "2":
                 self.form["pay_by_date"] = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=14)).isoformat()
             elif value == "3":
                 d = dt.date.fromisoformat(self.as_of_date); n = d.replace(day=28) + dt.timedelta(days=4)
@@ -366,8 +477,6 @@ class TerminalSession:
             elif value == "4":
                 self.questions[self.question_index] = "date"
                 return [self._prompt()]
-            elif key == "deadline_conflict" and value not in {"", "1"}:
-                self.form["pay_by_date"] = dt.date.fromisoformat(value).isoformat()
             else:
                 self.form["pay_by_date"] = None
         elif key == "date":
@@ -377,14 +486,32 @@ class TerminalSession:
                 self._block("text", "That date is beyond the 90-day forecast; I'll show the earliest safe date instead.")
             else:
                 self.form["pay_by_date"] = parsed.isoformat() if parsed else None
-        elif key == "partial": self.form["allow_partial"] = value == "2"
+        elif key == "partial":
+            self.form["allow_partial"] = value == "2"
+            if value != "2":
+                self.form["partial_declined"] = True
+            if value == "2" and "installments" in self.questions[self.question_index + 1:]:
+                self.questions.remove("installments")
+                self.form["allow_installments"] = False
         elif key == "installments":
-            self.form["allow_installments"] = bool(value and value != "1")
-            if value and value != "1": self.form["installment_count"] = choices[key][value]
-            if self.form["allow_installments"]: self.questions.insert(self.question_index + 1, "fee")
+            self.form["allow_installments"] = True if count_only else bool(value and value != "1")
+            if count_only:
+                self.form["installment_count"] = installment_choices.get(value, installment_choices["1"])
+            elif value and value != "1":
+                self.form["installment_count"] = choices[key][value]
+            else:
+                self.form["installments_declined"] = True
+            self._installment_count_given = bool(self.form["allow_installments"])
+            self._installment_count_only = False
         elif key == "fee": self.form["installment_fee_pct"] = float(value) if value else 0.0
         self.question_index += 1
         blocks = []
+        if key == "deadline_conflict" and getattr(self, "_conflict_reasks_installments", False):
+            # The conflict question replaced a pending installments question;
+            # once the deadline is resolved the count still needs an answer.
+            self._conflict_reasks_installments = False
+            if value != "2" and "installments" not in self.questions[self.question_index:]:
+                self.questions.insert(self.question_index, "installments")
         if key in {"deadline", "deadline_conflict"} and self.form.get("pay_by_date") and self.form.get("allow_installments") and self._has_installment_conflict(self.form["pay_by_date"]):
             conflict_index = max(0, self.question_index - 1)
             self.questions[conflict_index] = "deadline_conflict"
@@ -393,7 +520,10 @@ class TerminalSession:
             self._prompt()
             return self.last_blocks
         if key in {"deadline", "deadline_conflict"} and self.form.get("pay_by_date") and not self._eligible_installment_counts() and "installments" in self.questions[self.question_index:]:
-            self.questions.remove("installments")
+            index = self.questions.index("installments", self.question_index)
+            self.questions[index] = "deadline_conflict"
+            self.form["installment_count"] = min(self.installment_counts)
+            self._conflict_reasks_installments = True
             blocks.append(self._block("text", self._installment_deadline_message(self.form["pay_by_date"])))
         if self.question_index < len(self.questions):
             blocks.append(self._prompt())
@@ -422,6 +552,13 @@ class TerminalSession:
             fp.event.error(session_id=self.session_id, agent_id="assistant", error_type=type(exc).__name__, message=str(exc)[:300])
             return [self._block("error", f"Unable to produce advice: {exc}")]
 
+    def _unmet_deadline(self, result):
+        """True when the recommended installment plan finishes after the kept deadline."""
+        chosen = result.get("recommended_option") or {}
+        deadline = self.form.get("pay_by_date")
+        return bool(deadline and chosen.get("type") == "installments"
+                    and chosen.get("meets_deadline") is False)
+
     def render_report(self, result):
         currency = self.form["currency"]
         options = result.get("ranked_options", [])
@@ -429,7 +566,10 @@ class TerminalSession:
         if chosen is not None and not chosen.get("safe", False):
             chosen = None
         not_affordable = str(result.get("decision", {}).get("affordability_status")) == "not_affordable"
-        if not_affordable or chosen is None:
+        unmet_deadline = self._unmet_deadline(result)
+        if unmet_deadline:
+            verdict = f"NOT RECOMMENDED: no allowed plan completes by {self.form['pay_by_date']}"
+        elif not_affordable or chosen is None:
             verdict = "NOT RECOMMENDED: no option keeps your balance above the minimum"
         elif chosen["type"] == "pay_in_full_now": verdict = "PAY IN FULL TODAY"
         elif chosen["type"] == "installments": verdict = f"PAY IN {self.form.get('installment_count', 3)} INSTALLMENTS"
@@ -460,14 +600,26 @@ class TerminalSession:
             rows.append(f"{option['type'].replace('_',' '):22} {', '.join(option['dates']):20} {money(option['total_cost'],currency):16} {money(option['lowest_projected_balance'],currency):16} {meets}   {safe_mark} {'SAFE' if option.get('safe') else 'UNSAFE'}")
             if not option.get("safe"):
                 rows.append(f"                         Note: {safety}")
-        other_safe_items = [x for x in options if x.get("safe") and x is not chosen]
+        allowed_types = {{"full_payment": "pay_in_full_now", "partial_payment": "partial_then_remainder",
+                          "installments": "installments", "wait": "wait"}.get(method)
+                         for method in self.assistant._profile_allowed_methods()}
+        other_safe_items = [x for x in options if x.get("safe") and x is not chosen
+                            and x.get("type") in allowed_types]
         other_safe_names = [x["type"].replace("_", " ") for x in other_safe_items]
         earliest = situation.get("earliest_date_for_full_payment")
         safe_today = float(result["decision"].get("amount_safe_to_pay", 0) or 0)
         spending_changes = result["decision"].get("spending_changes_needed", "none")
+        shortest_plan = installment_completion_date(self.as_of_date, min(self.installment_counts))
         alts = []
 
-        if verdict.startswith("PAY IN FULL TODAY"):
+        if unmet_deadline:
+            alts.append(
+                f"No payment method you would consider completes by {self.form['pay_by_date']}; "
+                f"the shortest allowed plan ends on {shortest_plan}, after the deadline.")
+            alts.append(f"Remove the deadline or pick a date on or after {shortest_plan} to see a recommended plan.")
+            if other_safe_names:
+                alts.append(f"Safe alternative options: {', '.join(other_safe_names)}.")
+        elif verdict.startswith("PAY IN FULL TODAY"):
             if other_safe_names:
                 alts.append(f"Other safe payment structures: {', '.join(other_safe_names)}.")
             else:
@@ -498,7 +650,8 @@ class TerminalSession:
             if not alts:
                 alts.append(f"Waiting until {earliest} avoids dropping below your required minimum balance.")
         else:
-            if earliest and earliest > self.as_of_date:
+            if ("full_payment" in self.assistant._profile_allowed_methods()
+                    and earliest and earliest > self.as_of_date):
                 alts.append(f"Full payment alternative: wait until {earliest} to pay in full and avoid fees.")
             if other_safe_names:
                 alts.append(f"Other safe options: {', '.join(other_safe_names)}.")
@@ -507,7 +660,13 @@ class TerminalSession:
             if not alts:
                 alts.append("The selected plan is the earliest way to proceed safely without overdraft risk.")
 
-        if verdict.startswith("NOT RECOMMENDED"):
+        if unmet_deadline:
+            steps = [
+                f"Do not start this plan: nothing you would consider completes by {self.form['pay_by_date']}.",
+                f"Pick a deadline on or after {shortest_plan}, or remove the deadline, then ask again.",
+                "This answer could change if you move the deadline or choose fewer installments.",
+            ]
+        elif verdict.startswith("NOT RECOMMENDED"):
             steps = ["Do not make this payment now"]
             if safe_today > 0:
                 steps.append(f"Amount safe to pay today: {money(safe_today, currency)}.")
@@ -554,7 +713,9 @@ class TerminalSession:
         rendered = self.render_report(result)
         verdict = rendered.split("╭─ ", 1)[1].split(" ─╮", 1)[0]
         chosen = result.get("recommended_option")
-        if not_affordable := (str(result.get("decision", {}).get("affordability_status")) == "not_affordable"):
+        if self._unmet_deadline(result):
+            status = "bad"
+        elif not_affordable := (str(result.get("decision", {}).get("affordability_status")) == "not_affordable"):
             status = "bad"
         elif chosen is None or not chosen.get("safe", False):
             status = "bad"
@@ -641,6 +802,15 @@ class TerminalSession:
         if re.fullmatch(r"(?:3|6|12)\s+installments?", low):
             return False
         if re.fullmatch(r"by\s+20\d\d-\d\d-\d\d", low):
+            return False
+        if _is_installment_count_followup(low):
+            # "change number of installments to 3" & co. amend the prior request.
+            return False
+        if (self.report is not None and not _CURRENCY_RE.search(low)
+                and not _PURCHASE_CUE_RE.search(low)
+                and re.search(r"\b(?:to|be|into)\s+\d", low)):
+            # A bare number after to/be/into with no currency and no purchase cue
+            # is never a new amount for a fresh request.
             return False
         return True
 
@@ -738,7 +908,17 @@ class TerminalSession:
             else:
                 previous = self._comparison(self.report) if self.report else None
                 changed = self._apply_followup(text)
-                if changed:
+                if changed and self._has_installment_conflict(self.form.get("pay_by_date")):
+                    # The follow-up kept the deadline but its plan no longer
+                    # completes by it: resolve with the first flow's conflict
+                    # question instead of recommending a late plan.
+                    self.phase = "intake"
+                    self.questions = ["deadline_conflict"]
+                    self.question_index = 0
+                    self._conflict_reasks_installments = False
+                    self._block("text", f"The selected {self.form['installment_count']}-installment plan conflicts with the deadline {self.form['pay_by_date']}.")
+                    self._prompt()
+                elif changed:
                     blocks = self._make_report()
                     if self.report and previous:
                         comparison = self._block("text", "WHAT CHANGED\n" + self._comparison(self.report, previous))
@@ -793,9 +973,18 @@ class TerminalSession:
             elif "half" in low:
                 self.form["partial_amount"] = self.form["amount"] * 0.5
             return True
-        count = re.search(r"\b(3|6|12)\s+installments?\b", low)
+        count = _followup_count(low)
         if count:
-            self.form.update(allow_installments=True, installment_count=int(count.group(1)), allow_partial=False)
+            # Amending the installment count keeps the same amount, item and
+            # deadline; it never re-asks intake questions.
+            self.form.update(allow_installments=True, installment_count=count, allow_partial=False)
+            self.form.pop("installments_declined", None)
+            self._installment_count_given = True
+            self._installment_count_only = False
+            cap = self.assistant._max_installment_months()
+            if cap and self.form["installment_count"] > cap:
+                self.form["installment_count"] = cap
+                self._block("text", f"Your profile allows at most {cap} installments; using {cap}.")
             return True
         if re.search(r"\bwait\b|\ba month later\b", low):
             date = dt.date.fromisoformat(self.as_of_date)

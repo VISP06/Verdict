@@ -34,10 +34,13 @@ def start(text="Can I afford a 12k laptop?"):
 def test_intake_defaults_complete_report_and_partial_installment_paths():
     session, blocks = start()
     assert "When do you need" in blocks[-1]["text"]
-    for _ in range(3): blocks = session.handle("")
+    blocks = session.handle("")          # no deadline -> method question
+    assert "How would you like to pay?" in blocks[-1]["text"]
+    blocks = session.handle("")          # Let Verdict decide -> report
     assert blocks[0]["kind"] == "report"
     assert session.report
     session, _ = start("Can I pay half now for a 12k laptop?")
+    assert session.form["partial_amount"] == 6000
     assert "When do you need" in session.last_blocks[-1]["text"]
     blocks = session.handle("")
     assert session.form["allow_partial"]
@@ -45,14 +48,16 @@ def test_intake_defaults_complete_report_and_partial_installment_paths():
     session, _ = start("Laptop 12k in 3 installments")
     assert session.form["allow_installments"] and session.form["installment_count"] == 3
     session, _ = start("Laptop 12k no deadline")
-    session.handle("1")
-    blocks = session.handle("2")
+    blocks = session.handle("3")         # pay part now -> amount question
+    assert "How much do you want to pay now?" in blocks[-1]["text"]
+    blocks = session.handle("")          # safest amount -> report
+    assert session.form["allow_partial"] and session.form.get("partial_amount")
     assert blocks[0]["kind"] == "report"
 
 
 def test_skipped_questions_and_invalid_answers():
     session, blocks = start("Laptop 12k, no deadline")
-    assert "partial payment" in blocks[-1]["text"]
+    assert "How would you like to pay?" in blocks[-1]["text"]
     session, _ = start()
     session.handle("bogus")
     assert session.phase == "intake"
@@ -101,18 +106,19 @@ def test_report_verdict_controls_steps_and_pending_items_are_reported_once():
 
 
 def test_deadline_filters_installments_and_conflicting_deadline_reasks():
-    # With a deadline but no installments chosen, nothing about installments is
-    # mentioned before the question is asked; the conflict appears only after
-    # the user answers "Use installments?".
+    # With a deadline but no method chosen, the intake asks the method question
+    # first; the conflict appears only after installments are actually chosen.
     session, blocks = start("Laptop 12k end of this month")
     assert session.form["pay_by_date"] == "2025-11-30"
-    assert not any("installment" in block["text"].lower() for block in blocks)
-    blocks = session.handle("1")  # partial: no
-    assert "Use installments?" in blocks[-1]["text"]
-    blocks = session.handle("2")  # 3 months: finishes 2026-01-03, after the deadline
-    assert any("conflicts with the deadline" in block["text"] for block in blocks)
-    blocks = session.handle("1")  # remove the deadline
+    assert not any("completes by" in block["text"] for block in blocks)
+    assert "How would you like to pay?" in blocks[-1]["text"]
+    blocks = session.handle("4")  # installments chosen: the pending count question
+                                  # is replaced by the deadline conflict at once
+    assert any("No installment option completes by" in block["text"] for block in blocks)
+    blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
     assert session.form["pay_by_date"] is None
+    assert "How many installments?" in blocks[-1]["text"]
+    blocks = session.handle("")
     assert any(block["kind"] == "report" for block in blocks)
 
     # If an installment count was stated first, a conflicting deadline is rejected
@@ -129,7 +135,7 @@ def test_deadline_filters_installments_and_conflicting_deadline_reasks():
 
 def test_installment_options_for_no_deadline_and_shared_completion_date():
     session, blocks = start("Laptop 12k no deadline")
-    blocks = session.handle("1")  # no partial payment
+    blocks = session.handle("4")  # choose installments -> count question
     # The menu never offers counts above the profile cap; user_05 allows 4,
     # so only the 3-month plan is listed.
     assert "3 months" in blocks[0]["text"]
@@ -147,11 +153,9 @@ def test_deadline_answer_filters_later_installments_and_why_users_are_evidence_b
     blocks = session.handle("3")  # end of this month
     # No installments chosen yet: no conflict message, the intake continues.
     assert not any("No installment option completes by" in block["text"] for block in blocks)
-    assert "Is partial payment acceptable?" in blocks[-1]["text"]
-    blocks = session.handle("1")  # partial: no
-    assert "Use installments?" in blocks[-1]["text"]
-    blocks = session.handle("2")  # 3 months conflicts with the deadline
-    assert any("conflicts with the deadline" in block["text"] for block in blocks)
+    assert "How would you like to pay?" in blocks[-1]["text"]
+    blocks = session.handle("4")  # installments chosen: conflict raised at once
+    assert any("No installment option completes by" in block["text"] for block in blocks)
 
     demo = TerminalSession("user_07", "2025-11-04")
     assert demo.assistant.engine.get_user_home_currency("user_07") == "INR"
@@ -210,6 +214,98 @@ def test_user_resets_to_latest_event_date_and_date_error_has_range():
     assert "Data range:" in response and session.as_of_date in response
     error = session.handle("/date 1900-01-01")[0]["text"]
     assert "Allowed range" in error and "through" in error
+
+
+def test_default_as_of_is_day_after_latest_event():
+    for user_id, expected in (("user_05", "2025-11-05"), ("user_07", "2024-09-05"),
+                              ("user_20", "2026-02-07"), ("user_23", "2025-05-07")):
+        session = TerminalSession(user_id)
+        assert session.as_of_date == expected
+        assert session.as_of_defaulted
+        assert session.as_of_note == f"Using {expected}, the day after your latest bank record."
+    session = TerminalSession("user_07", "2024-09-04")
+    assert not session.as_of_defaulted
+    assert session.as_of_note is None
+
+
+def test_user_switch_uses_default_as_of_note():
+    session = TerminalSession("user_07", "2024-09-05")
+    response = session.handle("/user user_23")[0]["text"]
+    assert response == ("User set to user_23. Data range: 2024-11-13 through 2025-05-06. "
+                        "Using 2025-05-07, the day after your latest bank record.")
+    assert session.as_of_date == "2025-05-07"
+
+
+def test_date_before_history_blocks_advice_with_guard_message():
+    session = TerminalSession("user_23", "2024-09-05")
+    blocks = session.handle("Laptop 8k")
+    assert blocks[0]["kind"] == "error"
+    assert "No bank history for user_23 before 2024-09-05" in blocks[0]["text"]
+    assert "their history runs 2024-11-13 to 2025-05-06" in blocks[0]["text"]
+    assert "Use /date 2025-05-07." in blocks[0]["text"]
+    assert session.phase == "ready"
+    assert not session.form
+    # The guard is lifted by switching to a date inside the history range.
+    session.handle("/date 2025-05-07")
+    blocks = session.handle("Laptop 8k")
+    assert blocks[0]["text"].startswith("Got it:")
+
+
+def test_not_recommended_why_has_no_unqualified_safe_claim():
+    # user_07 at the default as-of: 500k cannot be paid safely by any method,
+    # so "why not now" must say so instead of claiming a safe payment.
+    session = TerminalSession("user_07")
+    session.handle("Laptop 500000 no deadline just advise")
+    assert "NOT RECOMMENDED" in render_headline(session)
+    text = session.handle("why not now")[0]["text"]
+    assert "would not be safe" in text
+    assert "would be safe" not in text
+    assert "What works: pay up to INR 103,080.99 today." in text
+
+
+def test_why_not_now_names_the_rule_that_blocks_a_safe_payment():
+    # Full payment would be safe but the profile excludes it: the profile rule
+    # must be named right after the safe claim.
+    session = TerminalSession("user_07")
+    session.handle("Laptop 12000 no deadline just advise")
+    text = session.handle("why not now")[0]["text"]
+    assert "would be safe:" in text
+    assert "But you told us you only consider installments. [Profile]" in text
+
+
+def test_why_not_now_names_the_deadline_rule_when_it_blocks_the_plan():
+    # The interactive conflict flow usually prevents an unmet deadline; the
+    # follow-up must still explain one when it reaches the report.
+    session = TerminalSession("user_23", "2025-05-07")
+    session.handle("Laptop 8000 no deadline just advise")
+    result = session.report
+    result["recommended_option"] = {"type": "installments", "safe": True,
+                                    "dates": ["2025-05-07", "2025-06-06", "2025-07-06"],
+                                    "amounts": {}, "meets_deadline": False,
+                                    "total_cost": 8000.0, "lowest_projected_balance": 29601.86}
+    session.form["pay_by_date"] = "2025-05-14"
+    assert "NOT RECOMMENDED" in render_headline(session)
+    text = session._why_not_now_text()
+    assert "would be safe:" in text
+    assert ("But nothing you consider completes by your deadline 2025-05-14. [Your deadline]" in text)
+
+
+def render_headline(session):
+    return session.render_report(session.report).split("\n", 1)[0]
+
+
+def test_installments_intake_flow_at_default_as_of():
+    # The transcript flow: statement, deadline, count question, report.
+    session = TerminalSession("user_07")
+    blocks = session.handle("Laptop 12k")
+    joined = " ".join(block["text"] for block in blocks)
+    assert session.as_of_date == "2024-09-05"
+    assert "Your profile only allows installments." in joined
+    assert "When do you need to pay?" in blocks[-1]["text"]
+    blocks = session.handle("")  # no deadline
+    assert "How many installments?" in blocks[-1]["text"]
+    blocks = session.handle("")  # default 3-month plan
+    assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
 
 
 @pytest.mark.parametrize(("text", "expected"), [
@@ -446,20 +542,23 @@ def test_intake_explicit_partial_skips_installments():
     assert session.form["partial_amount"] == 6000
 
 
-def test_partial_yes_removes_installments_question_and_no_keeps_it():
-    session = TerminalSession("user_07", "2024-09-04")
-    session.handle("Can I afford a laptop that costs 80000?")
-    assert session.questions == ["deadline", "installments"]
-    session.handle("")  # no deadline
-    blocks = session.handle("2")  # shortest installment plan
+def test_method_choice_controls_follow_up_questions():
+    session, _ = start("Can I afford a laptop that costs 80000?")  # user_05 allows all methods
+    session.handle("")  # no deadline -> method question
+    blocks = session.handle("3")  # pay part now -> amount question, never a count question
+    assert "How much do you want to pay now?" in blocks[-1]["text"]
+    assert "installments" not in session.questions
+    blocks = session.handle("")  # safest amount
     assert any(block["kind"] == "report" for block in blocks)
-    assert session.form["allow_installments"] is True
+    assert session.form["allow_partial"] is True
+    assert session.form["allow_installments"] is False
 
     session, _ = start("Can I afford a laptop that costs 80000?")
     session.handle("")
-    blocks = session.handle("1")  # partial: no
-    assert "installments" in session.questions
-    assert "installments" in blocks[-1]["text"]
+    blocks = session.handle("2")  # pay in full today -> straight to the report
+    assert any(block["kind"] == "report" for block in blocks)
+    assert "installments" not in session.questions
+    assert session.form["allow_installments"] is False
 
 
 def test_plain_request_still_asks_full_intake():

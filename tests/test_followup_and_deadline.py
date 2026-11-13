@@ -34,6 +34,8 @@ from terminal_flow import TerminalSession
 FAKE_USERS = (
     ("fx_inst12", "installments", "12"),  # installments-only profile, generous cap
     ("fx_full", "full_payment", ""),      # full-payment-only profile, no cap
+    ("fx_all3", "full_payment|partial_payment|installments", "12"),  # every method
+    ("fx_partial", "partial_payment", ""),  # partial-only profile, no cap
 )
 AS_OF = "2024-09-05"
 # With the first installment paid on the as-of date: 3 -> 2024-11-04, 6 -> 2025-02-02.
@@ -223,33 +225,37 @@ def test_conflict_prompt_offers_full_payment_only_when_profile_allows(fake_datas
 
 
 def test_installments_not_mentioned_before_asking_when_not_chosen(fake_dataset):
-    # Deadline stated in the sentence, installments never chosen: the intake
-    # goes straight to its own questions and only mentions installments when
-    # it asks "Use installments?".
+    # The installments-only profile states its rule instead of asking, and the
+    # pending count question is raised as a deadline conflict right away.
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Laptop 12k end of this month")
     assert session.form["pay_by_date"] == "2024-09-30"
-    assert any("how many installments" in block["text"].lower() for block in blocks)
-    blocks = session.handle("1")  # shortest installment plan
-    assert "conflicts with the deadline" in " ".join(block["text"] for block in blocks)
-    blocks = session.handle("1")  # remove the deadline
+    joined = " ".join(block["text"] for block in blocks)
+    assert "Your profile only allows installments." in joined
+    assert "No installment option completes by" in joined
+    assert "How many installments?" not in joined
+    blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
     assert session.form["pay_by_date"] is None
+    assert "How many installments?" in blocks[-1]["text"]
+    blocks = session.handle("")  # default 3-month plan
     assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
 
 
 def test_deadline_question_answer_does_not_pre_filter_unchosen_installments(fake_dataset):
-    # Deadline answered as a question with no installments chosen: no
+    # Deadline answered as a question with no method chosen: no
     # "No installment option completes by..." message before asking.
-    _assistant, session = _session(fake_dataset)
+    _assistant, session = _session(fake_dataset, "fx_all3")
     session.handle("Laptop 12k")
     blocks = session.handle("2")  # within 14 days -> 2024-09-19
     assert not any("No installment option completes by" in block["text"] for block in blocks)
-    assert "How many installments?" in blocks[-1]["text"]
-    blocks = session.handle("1")  # shortest plan
-    assert any("conflicts with the deadline 2024-09-19" in block["text"] for block in blocks)
-    blocks = session.handle("1")  # remove the deadline
+    assert "How would you like to pay?" in blocks[-1]["text"]
+    blocks = session.handle("4")  # installments chosen -> conflict raised at once
+    assert any("No installment option completes by 2024-09-19" in block["text"] for block in blocks)
+    blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
     assert session.form["pay_by_date"] is None
-    assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
+    assert "How many installments?" in blocks[-1]["text"]
+    blocks = session.handle("")
+    assert any(block["kind"] == "report" for block in blocks)
 
 
 def test_earlier_disallowed_safe_options_wording(fake_dataset):
@@ -281,7 +287,7 @@ def test_item_extraction_drops_relative_pronoun(fake_dataset):
     assert TerminalSession._request_item("Can I afford a laptop that costs 80000? ") == "laptop"
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Can I afford a laptop that costs 80000?")
-    assert "Got it: INR 80,000.00 · laptop · no deadline given yet." == blocks[0]["text"]
+    assert "Got it: INR 80,000.00 · laptop · installments · no deadline given yet." == blocks[0]["text"]
 
 
 def test_profile_gates_questions_chips_and_neutral_followups(fake_dataset):
@@ -313,8 +319,89 @@ def test_plain_why_and_why_not_now_use_distinct_evidence(fake_dataset):
     assert "No unsettled bank items affect this" in why
     not_now = session.handle("why not now")[0]["text"]
     assert "would be safe" in not_now
-    assert "You told us you only consider" in not_now
+    assert "But you told us you only consider installments. [Profile]" in not_now
     assert not_now != why
+
+
+def test_method_question_lists_only_profile_methods(fake_dataset):
+    # Multi-method profile: one question with all four choices.
+    _assistant, session = _session(fake_dataset, "fx_all3")
+    blocks = session.handle("Laptop 12k")
+    assert "When do you need to pay?" in blocks[-1]["text"]
+    blocks = session.handle("")  # no deadline -> method question
+    assert "How would you like to pay?" in blocks[-1]["text"]
+    prompt = blocks[-1]["text"]
+    assert "1 Let Verdict decide (default)" in prompt
+    assert "2 Pay in full today" in prompt
+    assert "3 Pay part now and the rest later" in prompt
+    assert "4 Pay in installments" in prompt
+    # Single-method profiles never get the question; they get the rule instead.
+    _assistant2, session2 = _session(fake_dataset, "fx_full")
+    blocks2 = session2.handle("Laptop 12k")
+    joined = " ".join(block["text"] for block in blocks2)
+    assert "Your profile only allows paying in full." in joined
+    assert session2.questions == ["deadline"]
+
+
+def test_single_partial_method_goes_straight_to_amount(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_partial")
+    blocks = session.handle("Laptop 12k")
+    joined = " ".join(block["text"] for block in blocks)
+    assert "Your profile only allows partial payments." in joined
+    assert session.questions == ["deadline", "partial_amount"]
+    blocks = session.handle("")  # no deadline -> amount question
+    assert "How much do you want to pay now?" in blocks[-1]["text"]
+    blocks = session.handle("")  # safest amount (whole amount fits the capacity)
+    assert session.form["allow_partial"] is True
+    assert session.form["partial_amount"] == 12000
+    assert any(block["kind"] == "report" for block in blocks)
+
+
+def test_let_verdict_decide_uses_every_profile_method(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_all3")
+    session.handle("Laptop 12k")
+    session.handle("")  # no deadline
+    blocks = session.handle("")  # Let Verdict decide
+    assert any(block["kind"] == "report" for block in blocks)
+    assert session.form["allow_partial"] is True
+    assert session.form["allow_installments"] is False
+    assert "PAY IN FULL TODAY" in blocks[-1]["text"]
+
+
+def test_partial_amount_question_defaults_to_safest_and_clamps(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_all3")
+    session.handle("Laptop 150k")
+    session.handle("")  # no deadline
+    blocks = session.handle("3")  # pay part now
+    prompt = blocks[-1]["text"]
+    assert "INR 103,080.99 now (safest, default)" in prompt
+    assert "INR 75,000.00 now (half)" in prompt
+    blocks = session.handle("120000")  # typed amount above the safe capacity
+    assert any("Only INR 103,080.99 is safe to pay today; using it." in block["text"]
+               for block in blocks)
+    assert abs(session.form["partial_amount"] - 103080.99) < 0.01
+    assert any(block["kind"] == "report" for block in blocks)
+
+
+def test_partial_amount_rejects_above_amount_then_defaults(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_all3")
+    session.handle("Laptop 150k")
+    session.handle("")  # no deadline
+    session.handle("3")  # pay part now
+    blocks = session.handle("200000")  # above the requested amount
+    assert "Enter an amount up to INR 150,000.00" in blocks[0]["text"]
+    blocks = session.handle("200000")  # second miss falls back to the safest amount
+    assert any(block["kind"] == "report" for block in blocks)
+    assert abs(session.form["partial_amount"] - 103080.99) < 0.01
+
+
+def test_not_recommended_why_has_no_unqualified_safe_claim(fake_dataset):
+    _assistant, session = _session(fake_dataset)
+    session.handle("Laptop 500k no deadline just advise")
+    text = session.handle("why not now")[0]["text"]
+    assert "would not be safe" in text
+    assert "would be safe" not in text
+    assert "What works: pay up to INR 103,080.99 today." in text
 
 
 def test_safe_but_profile_excluded_payment_is_disclosed(fake_dataset):

@@ -30,7 +30,7 @@ html,body,[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,#
 .welcome,.block{background:#0D2233;border:1px solid #1F4660;border-radius:8px;padding:1rem 1.15rem;margin:.7rem 0;color:#D8F3FF;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
 .welcome{border-color:#24516a}.welcome p{margin:.1rem 0 .8rem}.commands{font-size:.76rem;color:#7FA6BD;margin-top:.5rem}
 .user-input{color:#D8F3FF}.user-input .prefix{color:#5CE1E6}.prompt-question{color:#8CC8FF;font-weight:600}.option-chip{display:inline-block;color:#8CC8FF;border:1px solid #31536b;border-radius:4px;padding:.08rem .4rem;margin:.45rem .35rem 0 0;font-size:.78rem}.option-chip.default{border-color:#5CE1E6;color:#5CE1E6}
-.report{border:1px solid #1F4660;border-left:4px solid var(--status);border-radius:8px;background:#0D2233;padding:1rem 1.2rem;margin:.7rem 0;color:#D8F3FF;line-height:1.55;overflow-wrap:anywhere}.verdict{font-size:1.35rem;font-weight:700;color:var(--status);margin-bottom:.9rem}.section-title{color:#5CE1E6;font-size:.78rem;letter-spacing:.16em;font-weight:700;margin:1rem 0 .35rem}.report p{margin:.25rem 0}.spark{color:#5CE1E6;letter-spacing:.12em;font-size:1.1rem}.range{color:#7FA6BD;font-size:.78rem}.options-table{border-collapse:collapse;width:100%;font-family:inherit;font-size:.78rem}.options-table th{text-align:left;color:#7FA6BD;border-bottom:1px solid #31536b;padding:.35rem}.options-table td{padding:.35rem;border-bottom:1px solid #1a394e;vertical-align:top}.safe{color:#7CF5C0}.unsafe{color:#FF7A90}.unsafe-note{color:#FF7A90;padding:.1rem 0 .35rem 1rem;font-size:.76rem}.error{color:#FF7A90}
+.report{border:1px solid #1F4660;border-left:4px solid var(--status);border-radius:8px;background:#0D2233;padding:1rem 1.2rem;margin:.7rem 0;color:#D8F3FF;line-height:1.55;overflow-wrap:anywhere}.verdict{font-size:1.35rem;font-weight:700;color:var(--status);margin-bottom:.9rem}.section-title{color:#5CE1E6;font-size:.78rem;letter-spacing:.16em;font-weight:700;margin:1rem 0 .35rem}.report p{margin:.25rem 0}.spark{color:#5CE1E6;letter-spacing:.12em;font-size:1.1rem}.range{color:#7FA6BD;font-size:.78rem}.options-table{border-collapse:collapse;width:100%;font-family:inherit;font-size:.78rem}.options-table th{text-align:left;color:#7FA6BD;border-bottom:1px solid #31536b;padding:.35rem}.options-table td{padding:.35rem;border-bottom:1px solid #1a394e;vertical-align:top}.options-table thead th:nth-child(5){white-space:nowrap;min-width:9ch}.options-table thead th:nth-child(6){white-space:nowrap;min-width:6ch}.safe{color:#7CF5C0}.unsafe{color:#FF7A90}.unsafe-note{color:#FF7A90;padding:.1rem 0 .35rem 1rem;font-size:.76rem}.error{color:#FF7A90}
 div[data-testid="stChatInput"]{border:1px solid #1F4660;background:#0D2233;position:relative;padding-left:5.7rem}div[data-testid="stChatInput"]:before{content:'glacier ❯';position:absolute;left:1rem;top:.85rem;color:#5CE1E6;font-family:'JetBrains Mono',monospace;font-size:.85rem;pointer-events:none}div[data-testid="stChatInput"] textarea{font-family:'JetBrains Mono',monospace;color:#D8F3FF;caret-color:#5CE1E6;background:transparent}div[data-testid="stChatInput"] button{background:transparent!important;border:0!important;color:#5CE1E6!important;box-shadow:none!important}
 div.stButton>button{background:#10283a;color:#8CC8FF;border:1px solid #31536b;border-radius:999px;font-family:inherit;font-size:.78rem;padding:.25rem .65rem}div.stButton>button:hover{border-color:#5CE1E6;color:#5CE1E6}
 [class*="st-key-mcq_"]{max-width:540px;margin:.15rem 0 .6rem}[class*="st-key-mcq_"] button{justify-content:flex-start;text-align:left;border-radius:8px;background:#0D2233;border:1px solid #1F4660;color:#D8F3FF;padding:.55rem .9rem;font-size:.86rem}[class*="st-key-mcq_"] button:hover{border-color:#5CE1E6;background:#10304a;color:#D8F3FF}[class*="st-key-mcq_"] button:focus-visible{outline:2px solid #5CE1E6}[class*="st-key-mcq_"] button p{display:flex;gap:.55rem;align-items:center;margin:0}[class*="st-key-mcq_"] button[kind="primary"]{border-color:#2c6f7a}
@@ -86,7 +86,11 @@ if (not isinstance(session, TerminalSession) or not hasattr(getattr(session, "as
     if date_key is None:
         assistant = Assistant(user_id, dt.date.today().isoformat(), dataset_dir=DATASET, no_llm=True)
         dates = assistant.engine.events[assistant.engine.events.user_id.astype(str).eq(user_id)].event_date.astype(str)
-        date_key = max(dates) if len(dates) else dt.date.today().isoformat()
+        if len(dates):
+            last = sorted(dates.astype(str))[-1][:10]
+            date_key = (dt.date.fromisoformat(last) + dt.timedelta(days=1)).isoformat()
+        else:
+            date_key = dt.date.today().isoformat()
         st.session_state.terminal_date = date_key
     session = TerminalSession(user_id, date_key, dataset_dir=DATASET,
                               assistant=Assistant(user_id, date_key, dataset_dir=DATASET, no_llm=True))
@@ -94,6 +98,8 @@ if (not isinstance(session, TerminalSession) or not hasattr(getattr(session, "as
     currency = str(session.assistant.engine.get_user_home_currency(user_id))
     st.session_state.terminal_output = [{"kind": "welcome", "plain_text": BANNER},
                                        {"kind": "text", "plain_text": f"Account currency: {currency}. Amounts without a currency are treated as {currency}."}]
+    if session.as_of_note:
+        st.session_state.terminal_output.append({"kind": "text", "plain_text": session.as_of_note})
 
 try:
     situation = session.assistant.situation()

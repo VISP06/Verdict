@@ -18,6 +18,9 @@ def main(argv=None):
     currency = str(session.assistant.engine.get_user_home_currency(session.user_id))
     print(BANNER)
     print(f"Account currency: {currency}. Amounts without a currency are treated as {currency}.")
+    note = session.as_of_note
+    if note:
+        print(note)
     try:
         while True:
             try: line = input("\033[96m>\033[0m ")

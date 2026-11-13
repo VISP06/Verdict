@@ -92,7 +92,7 @@ def test_report_followup_chip_recomputes_report(monkeypatch):
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
     at.chat_input[0].set_value("Laptop costs 12k no deadline just advise").run()
     assert not any(button.label == "Pay half now" for button in at.button)
-    next(button for button in at.button if button.label.startswith("Use 3 installments")).click().run()
+    next(button for button in at.button if button.label.startswith("Use 6 installments")).click().run()
     assert not at.exception
     rendered = "\n".join(x.value for x in at.markdown)
     assert "No change:" in rendered or "WHAT CHANGED" in rendered

@@ -15,6 +15,7 @@ from plan_dates import installment_completion_date
 
 _CURRENCIES = {"INR": "INR", "USD": "USD", "EUR": "EUR", "ZAR": "ZAR", "IDR": "IDR"}
 _SYMBOLS = {"₹": "INR", "$": "USD", "€": "EUR", "R": "ZAR"}
+_PROSE_SYMBOLS = {"INR": "₹", "USD": "$", "EUR": "€", "ZAR": "R", "IDR": "Rp"}
 _AMOUNT_RE = re.compile(
     r"(?<![\w.])(?:\d{1,3}(?:,\d{2})*,\d{3}(?:\.\d+)?|"
     r"\d{1,3}(?:,\d{2})+,\d{3}(?:\.\d+)?|\d{1,3}(?:,\d{3})+(?:\.\d+)?|"
@@ -186,6 +187,24 @@ class TerminalSession:
         counts = self._eligible_installment_counts() or list(self.installment_counts)
         return "1 {} months (default)".format(counts[0]) + "".join(f", {idx + 2} {count} months" for idx, count in enumerate(counts[1:]))
 
+    def _installment_deadline_note(self):
+        """Say when the deadline rules out some installment counts, with real end dates."""
+        deadline = self.form.get("pay_by_date")
+        if not deadline:
+            return None
+        eligible = self._eligible_installment_counts()
+        full_counts = list(self.installment_counts)
+        if not eligible or len(eligible) >= len(full_counts):
+            return None
+        excluded = min(count for count in full_counts if count not in eligible)
+        count_text = ", ".join(str(count) for count in eligible[:-1]) + f" and {eligible[-1]}" if len(eligible) > 1 else str(eligible[0])
+        single_one = len(eligible) == 1 and eligible[0] == 1
+        noun = "monthly payment" if single_one else "monthly payments"
+        verb = "finishes" if single_one else "finish"
+        end = installment_completion_date(self.as_of_date, excluded)
+        end_text = end if isinstance(end, str) else end.isoformat()
+        return f"Only {count_text} {noun} {verb} by {deadline} (a {excluded}-month plan would end {end_text})."
+
     def _installment_deadline_message(self, deadline):
         earliest = installment_completion_date(self.as_of_date, min(self.installment_counts))
         return (f"No installment option completes by {deadline}; the shortest plan ends "
@@ -276,6 +295,11 @@ class TerminalSession:
         clean_questions = {"deadline": "When do you need to pay?",
                            "installments": "How many installments?",
                            "fee": "Is there a fee for installments?"}
+        if question == "installments":
+            note = self._installment_deadline_note()
+            if note:
+                text = f"{text} {note}"
+                clean_questions["installments"] = f"How many installments? {note}"
         if question == "deadline": choices = [("1", "No deadline", True), ("2", "Within 14 days", False), ("3", "By the end of this month", False), ("4", "Pick a date…", False)]
         elif question == "installments":
             counts = self._eligible_installment_counts() or list(self.installment_counts)
@@ -716,6 +740,30 @@ class TerminalSession:
     def _fmt(self, value):
         return money(value, self.form["currency"])
 
+    def _prose(self, value):
+        """Whole-number currency for prose text, e.g. ₹184,081."""
+        symbol = _PROSE_SYMBOLS.get(self.form["currency"], self.form["currency"] + " ")
+        amount = round(float(value))
+        sign = "-" if amount < 0 else ""
+        return f"{sign}{symbol}{abs(amount):,.0f}"
+
+    def _short(self, day):
+        """Short prose date, e.g. 13 Sep."""
+        try:
+            parsed = dt.date.fromisoformat(str(day)[:10])
+        except (TypeError, ValueError):
+            return str(day)
+        return f"{parsed.day} {parsed.strftime('%b')}"
+
+    def _based_on_line(self, result=None):
+        """The single closing evidence line shared by WHY and 'Why not now?'."""
+        result = result if result is not None else (self.report or self.latest_result)
+        ref = self._employer_message_ref(result) if result else None
+        line = "Based on: your profile, your bank history and your salary pattern"
+        if ref:
+            line += f" and your employer's update {ref}"
+        return line + "."
+
     _CATEGORY_WORDS = {
         "rent": "rent", "debt_repayment": "loan EMI", "utilities": "electricity bill",
         "groceries": "groceries", "transport": "transport", "dining": "eating out",
@@ -796,14 +844,14 @@ class TerminalSession:
                  "dates": sorted(value["dates"]), "category": value["category"]}
                 for key, value in sorted(groups.items())]
 
-    def _employer_message_ref(self, result):
-        """EMP-xxx payroll reference of an employer message used for this answer."""
+    def _employer_message(self, result):
+        """(ref, sent date, text) of the employer message retrieved for this answer."""
         ids = result.get("evidence", {}).get("retrieved_message_ids", [])
         if not ids:
             ids = result.get("evidence", {}).get("explanation_evidence", {}).get("retrieved_message_ids", [])
         messages_path = os.path.join(self.dataset_dir, "messages.csv")
         if not ids or not os.path.exists(messages_path):
-            return None
+            return None, None, None
         wanted = {str(item) for item in ids}
         import csv
         try:
@@ -813,21 +861,65 @@ class TerminalSession:
                         continue
                     if str(row.get("source_type", "")).strip().lower() != "employer":
                         continue
-                    match = re.search(r"\bEMP-\d+\b", str(row.get("message_text", "")))
-                    return match.group(0) if match else str(row["message_id"])
+                    sent = str(row.get("sent_at") or "")[:10]
+                    if sent and self.as_of_date and sent > self.as_of_date:
+                        continue  # only messages sent on or before the as-of date
+                    text = str(row.get("message_text", ""))
+                    match = re.search(r"\bEMP-\d+\b", text)
+                    ref = match.group(0) if match else str(row["message_id"])
+                    return ref, sent, text
         except OSError:
+            return None, None, None
+        return None, None, None
+
+    def _employer_message_ref(self, result):
+        """EMP-xxx payroll reference of an employer message used for this answer."""
+        ref, _sent, _text = self._employer_message(result)
+        return ref
+
+    def _employer_payroll_note(self, result):
+        """Honest note when the employer's payroll date differs from the forecast's.
+
+        Display only: the forecast itself is never changed by this note.
+        """
+        ref, _sent, text = self._employer_message(result)
+        if not ref or not text:
             return None
-        return None
+        match = re.search(r"\b(20\d\d-\d\d-\d\d)\b", text)
+        if not match:
+            return None
+        try:
+            said = dt.date.fromisoformat(match.group(1))
+        except ValueError:
+            return None
+        upcoming = sorted(day for fact in self._income_facts(result)
+                          for day in fact["dates"] if day >= self.as_of_date)
+        if not upcoming or said.isoformat() in upcoming:
+            return None  # the forecast already lands salary on the employer's date
+        assumed_day = int(upcoming[0].split("-")[2])
+        return (f"Your employer says salary is now expected on {self._short(said)}; "
+                f"this forecast still assumes the {self._ordinal(assumed_day)}.")
+
+    def _employer_line(self, result):
+        """The employer sentence for the report's WHY section (honest about dates)."""
+        ref, _sent, text = self._employer_message(result)
+        if not ref:
+            return None
+        note = self._employer_payroll_note(result)
+        if note:
+            return note
+        if re.search(r"\b(20\d\d-\d\d-\d\d)\b", text or ""):
+            return f"Your employer's message {ref} agrees with the salary date this forecast assumes."
+        return f"Your employer's message {ref} was counted as evidence for this income."
 
     def _income_words(self, facts):
         """Plain-words description of counted income: salary, amount, day of month."""
         pieces = []
         for fact in facts:
-            amount = self._fmt(round(fact["monthly"], 2))
             category = str(fact.get("category") or "").strip().lower()
             day = int(fact["dates"][0].split("-")[2]) if fact["dates"] else 1
             word = "salary" if category == "salary" else self._CATEGORY_WORDS.get(category, "income")
-            pieces.append(f"your {word} of {amount} lands on the {self._ordinal(day)}")
+            pieces.append(f"your {word} of {self._prose(fact['monthly'])} lands on the {self._ordinal(day)}")
         return " and ".join(pieces)
 
     def _plan_effect_low(self, result, option):
@@ -842,41 +934,35 @@ class TerminalSession:
         return low_value, low_day
 
     def _why_section(self, result):
-        currency = self.form["currency"]
         situation = result["situation"]
         breakdown = result.get("evidence", {}).get("breakdown", {})
         lines = []
         # (a) Balance today and the amount to keep free.
-        lines.append(f"You have {self._fmt(situation['current_balance'])} available today and want to keep "
-                     f"at least {self._fmt(situation['minimum_balance'])} free. [Profile]")
+        lines.append(f"You have {self._prose(situation['current_balance'])} available today and want to keep "
+                     f"at least {self._prose(situation['minimum_balance'])} free.")
         # (b) Tightest point in the next 90 days with the biggest nearby outflows.
+        #     The baseline figure never assumes this payment, and says so.
         low_date = situation.get("lowest_projected_date") or self.as_of_date
         low = float(situation.get("lowest_projected_balance") or 0)
         names = self._outflows_around(breakdown, low_date)
         if names:
             joined = ", ".join(names[:-1]) + f" and {names[-1]}" if len(names) > 1 else names[0]
-            lines.append(f"The tightest point in the next 90 days is {low_date}, when your balance would be "
-                         f"about {self._fmt(low)} after your {joined} go out. [Bank history]")
+            lines.append(f"Before this payment, the lowest balance in the next 90 days is about "
+                         f"{self._prose(low)} on {self._short(low_date)}, after your {joined} go out.")
         else:
-            lines.append(f"The tightest point in the next 90 days is {low_date}, when your balance would be "
-                         f"about {self._fmt(low)}. [Bank history]")
-        # (c) Counted income in plain words, plus any employer message by its id.
+            lines.append(f"Before this payment, the lowest balance in the next 90 days is about "
+                         f"{self._prose(low)} on {self._short(low_date)}.")
+        # (c) Counted income in plain words, plus the honest employer payroll note.
         facts = self._income_facts(result)
         if facts:
-            lines.append(f"Counted income: {self._income_words(facts)} each month. [Income pattern]")
+            lines.append(f"Counted income: {self._income_words(facts)} each month.")
         else:
-            lines.append("No recurring income is counted in this forecast. [Income pattern]")
-        ref = self._employer_message_ref(result)
-        if ref:
-            reason_text = "; ".join(str(item.get("reason", "")) for item in breakdown.get("income_decisions", [])
-                                    if item.get("decision") == "counted")
-            if re.search(r"employer|message|payroll", reason_text, re.I):
-                lines.append(f"Your employer's message {ref} confirms this income with an updated expected "
-                             f"payroll date. [Employer message {ref}]")
-            else:
-                lines.append(f"Your employer's message {ref} was used when counting this income. "
-                             f"[Employer message {ref}]")
+            lines.append("No recurring income is counted in this forecast.")
+        employer_line = self._employer_line(result)
+        if employer_line:
+            lines.append(employer_line)
         # (d) One-sentence result: what the recommended plan does to the balance.
+        #     Every figure here assumes the payment leaves the account.
         chosen = result.get("recommended_option")
         if chosen is not None and not chosen.get("safe", False):
             chosen = None
@@ -885,36 +971,42 @@ class TerminalSession:
             full = next((x for x in result.get("ranked_options", []) if x["type"] == "pay_in_full_now"), None)
             if full:
                 low_value, low_day = full["lowest_projected_balance"], full["lowest_projected_date"]
-                shortfall = minimum - low_value
-                lines.append(f"Paying {self._fmt(self.form['amount'])} in full now would take you to "
-                             f"{self._fmt(low_value)} on {low_day}, {self._fmt(shortfall)} below your minimum, "
-                             f"so the full payment does not fit in the next 90 days.")
+                below = minimum - low_value
+                if below > 0:
+                    lines.append(f"Paying {self._prose(self.form['amount'])} in full now would take you to "
+                                 f"{self._prose(low_value)} on {self._short(low_day)}, {self._prose(below)} below "
+                                 f"your minimum, so the full payment does not fit in the next 90 days.")
+                else:
+                    lines.append(f"Paying {self._prose(self.form['amount'])} in full now would keep your lowest "
+                                 f"balance at {self._prose(low_value)} on {self._short(low_day)}, "
+                                 f"{self._prose(-below)} above your minimum.")
         else:
             low_value, low_day = self._plan_effect_low(result, chosen)
             margin = low_value - minimum
             above_below = "above" if margin >= 0 else "below"
-            amount_text = self._fmt(self.form["amount"])
+            amount_text = self._prose(self.form["amount"])
             if chosen["type"] == "pay_in_full_now":
-                lines.append(f"Paying {amount_text} in full now would take you to {self._fmt(low_value)} on "
-                             f"{low_day}, {self._fmt(margin)} {above_below} your minimum, so you can go ahead today.")
+                lines.append(f"Paying {amount_text} in full now would take you to {self._prose(low_value)} on "
+                             f"{self._short(low_day)}, {self._prose(margin)} {above_below} your minimum, "
+                             f"so you can go ahead today.")
             elif chosen["type"] == "installments":
                 count = self.form.get("installment_count", 3)
                 lines.append(f"Paying {amount_text} in {count} installments would take you to "
-                             f"{self._fmt(low_value)} on {low_day}, {self._fmt(margin)} {above_below} your minimum, "
-                             f"so the plan stays safe.")
+                             f"{self._prose(low_value)} on {self._short(low_day)}, {self._prose(margin)} "
+                             f"{above_below} your minimum, so the plan stays safe.")
             elif chosen["type"] == "wait":
                 wait_date = max(chosen["dates"])
-                lines.append(f"Waiting until {wait_date} to pay {amount_text} would take you to "
-                             f"{self._fmt(low_value)} on {low_day}, {self._fmt(margin)} {above_below} your minimum, "
-                             f"so waiting makes the payment safe.")
+                lines.append(f"Waiting until {self._short(wait_date)} to pay {amount_text} would take you to "
+                             f"{self._prose(low_value)} on {self._short(low_day)}, {self._prose(margin)} "
+                             f"{above_below} your minimum, so waiting makes the payment safe.")
             else:
                 entries = sorted(chosen["amounts"].items())
-                first_amount = self._fmt(entries[0][1])
+                first_amount = self._prose(entries[0][1])
                 rest_date = max(chosen["dates"])
-                rest_amount = self._fmt(self.form["amount"] - entries[0][1])
-                lines.append(f"Paying {first_amount} now and {rest_amount} on {rest_date} would take you to "
-                             f"{self._fmt(low_value)} on {low_day}, {self._fmt(margin)} {above_below} your minimum, "
-                             f"so splitting it works.")
+                rest_amount = self._prose(self.form["amount"] - entries[0][1])
+                lines.append(f"Paying {first_amount} now and {rest_amount} on {self._short(rest_date)} would "
+                             f"take you to {self._prose(low_value)} on {self._short(low_day)}, "
+                             f"{self._prose(margin)} {above_below} your minimum, so splitting it works.")
         # (e) Pending bank items in plain words.
         pending = situation.get("pending_items_considered_or_ignored") or {}
         ignored = list(pending.get("ignored") or [])
@@ -922,12 +1014,13 @@ class TerminalSession:
         if ignored:
             noun = "item is" if len(ignored) == 1 else "items are"
             lines.append(f"{len(ignored)} unsettled incoming {noun} not counted, because that money has not "
-                         f"actually arrived in your account yet. [Bank history]")
+                         f"actually arrived in your account yet.")
         elif considered:
             noun = "item is" if len(considered) == 1 else "items are"
-            lines.append(f"{len(considered)} unsettled bank {noun} already counted in this forecast. [Bank history]")
+            lines.append(f"{len(considered)} unsettled bank {noun} already counted in this forecast.")
         else:
-            lines.append("No unsettled bank items affect this. [Bank history]")
+            lines.append("No unsettled bank items affect this.")
+        lines.append(self._based_on_line(result))
         return "\n".join(lines)
 
     def _wait_methods_words(self):
@@ -982,14 +1075,31 @@ class TerminalSession:
         if "full_payment" in allowed:
             chips.append(("Wait a month", "wait a month"))
         if "installments" in allowed:
-            count = min(self.installment_counts)
-            chips.append((f"Use {count} installments", f"{count} installments"))
+            chip = self._installment_chip()
+            if chip:
+                chips.append(chip)
         chips.append(("Why not now?", "why not now"))
-        chips.append(("/why", "/why"))
         return chips
 
+    def _installment_chip(self):
+        """A 'Use N installments' chip only when N is allowed and meets the deadline.
+
+        Never offers the count the current verdict already uses.
+        """
+        chosen = (self.report or {}).get("recommended_option") or {}
+        verdict_installments = bool(chosen) and chosen.get("type") == "installments" and chosen.get("safe", False)
+        deadline = self.form.get("pay_by_date")
+        eligible = self._eligible_installment_counts()
+        counts = eligible if deadline else list(self.installment_counts)
+        if verdict_installments:
+            counts = [count for count in counts if count != int(self.form.get("installment_count") or 0)]
+        if not counts:
+            return None
+        count = min(counts)
+        return (f"Use {count} installments", f"{count} installments")
+
     def _timeline_line(self, result, count=3, window=14):
-        """The biggest outflows of the next two weeks, with amounts and dates."""
+        """The next few named outflows, with amounts and short dates."""
         flows = result.get("evidence", {}).get("breakdown", {}).get("flows_by_day", {})
         items = []
         for day in sorted(flows):
@@ -1001,26 +1111,30 @@ class TerminalSession:
         shown = sorted(sorted(items, key=lambda item: (-item[1], item[0]))[:count], key=lambda item: item[0])
         if not shown:
             return None
-        parts = [f"{label} {money(value, self.form['currency'])} on {day}" for day, value, label in shown]
-        return "Next outflows: " + ", ".join(parts) + ". [Bank history]"
+        parts = [f"{label} {self._prose(value)} on {self._short(day)}" for day, value, label in shown]
+        return "Coming up: " + ", ".join(parts) + "."
 
     def _next_income_line(self, result):
         """When counted income lands next, in plain words."""
         facts = self._income_facts(result)
         if not facts:
-            return "No counted income lands in the next 90 days. [Income pattern]"
+            return "Income: no counted income lands in the next 90 days."
         upcoming = sorted(day for fact in facts for day in fact["dates"] if day >= self.as_of_date)
-        words = self._income_words(facts)
+        pieces = []
+        for fact in facts:
+            category = str(fact.get("category") or "").strip().lower()
+            word = "salary" if category == "salary" else self._CATEGORY_WORDS.get(category, "income")
+            pieces.append(f"your {word} of {self._prose(fact['monthly'])}")
+        words = " and ".join(pieces)
         if upcoming:
-            return f"Counted income: {words}; the next payment lands on {upcoming[0]}. [Income pattern]"
-        return f"Counted income: {words} each month. [Income pattern]"
+            return f"Income: {words}; the next payment lands on {self._short(upcoming[0])}."
+        return f"Income: {words}."
 
     def _why_not_now_text(self):
         """Evidence-based answer to 'Why not now?', distinct from the report's WHY section."""
         result = self.report or self.latest_result
         if not result:
             return "No completed answer yet. Ask an amount first."
-        currency = self.form["currency"]
         options = result.get("ranked_options", [])
         chosen = result.get("recommended_option")
         if chosen is not None and not chosen.get("safe", False):
@@ -1028,7 +1142,7 @@ class TerminalSession:
         full = next((x for x in options if x["type"] == "pay_in_full_now"), None)
         allowed = self.assistant._profile_allowed_methods()
         amount_value = float(self.form.get("amount") or 0)
-        amount = money(amount_value, currency)
+        amount_text = self._prose(amount_value)
         situation = result["situation"]
         minimum = float(situation["minimum_balance"])
         # The headline is NOT RECOMMENDED both when nothing is affordable and
@@ -1036,79 +1150,55 @@ class TerminalSession:
         # must explain either case.
         not_recommended = chosen is None or self._unmet_deadline(result)
         lines = []
-        # 1. Straight answer: can the full amount leave the account today?
+        # 1. Straight one-line answer: can the full amount leave the account today?
         full_safe = bool(full and full.get("safe") and amount_value > 0)
         if full:
             low = float(full["lowest_projected_balance"])
-            low_date = full["lowest_projected_date"]
-            if full_safe:
-                lines.append(f"Yes — paying {amount} in full today would be safe: your lowest balance would be "
-                             f"{money(low, currency)} on {low_date}, {money(low - minimum, currency)} above your minimum. "
-                             f"[Bank history]")
-            else:
-                lines.append(f"No — paying {amount} in full today would not be safe: your balance would dip to "
-                             f"{money(low, currency)} on {low_date}, {money(max(0.0, minimum - low), currency)} below "
-                             f"your minimum of {money(minimum, currency)}. [Bank history]")
-        # 2. Short dated timeline of the next outflows and counted income.
+            low_day = self._short(full["lowest_projected_date"])
+        else:
+            low = float(situation.get("lowest_projected_balance") or 0) - amount_value
+            low_day = self._short(situation.get("lowest_projected_date") or self.as_of_date)
+        margin = low - minimum
+        room = f"{self._prose(abs(margin))} {'above' if margin >= 0 else 'below'} your minimum"
+        if full_safe:
+            lines.append(f"Yes — you can pay the full {amount_text} today.")
+        else:
+            lines.append(f"No — you cannot pay the full {amount_text} today.")
+        # 2. The lowest balance if you pay, always labelled as assuming the payment.
+        lines.append(f"If you pay it all today, your lowest balance would be about {self._prose(low)} "
+                     f"on {low_day}, {room}.")
+        # 3. Coming up: the next few named outflows.
         timeline = self._timeline_line(result)
         if timeline:
             lines.append(timeline)
+        # 4. Income, plus the honest employer payroll note when dates disagree.
         lines.append(self._next_income_line(result))
-        # 3. The tightest point and its margin over the minimum.
-        low = float(situation.get("lowest_projected_balance") or 0)
-        low_date = situation.get("lowest_projected_date") or self.as_of_date
-        margin = low - minimum
-        lines.append(f"The tightest point in the next 90 days is {low_date} at about {money(low, currency)}, "
-                     f"{money(margin, currency)} {'above' if margin >= 0 else 'below'} your minimum. [Bank history]")
-        # 4. What would work.
-        works = []
-        if chosen:
-            works.append(self._plan_words(result, chosen))
-            if chosen.get("type") != "pay_in_full_now":
-                safe_today = float((result.get("decision") or {}).get("amount_safe_to_pay") or 0)
-                if safe_today > 0:
-                    works.append(f"you could already pay up to {money(safe_today, currency)} today")
+        note = self._employer_payroll_note(result)
+        if note:
+            lines.append(note)
+        # 5. The real amount you could pay today and stay above your minimum,
+        #    computed from the situation's room, not capped at the request.
+        try:
+            capacity = max(0.0, float(situation["lowest_projected_balance"]) - minimum)
+        except (KeyError, TypeError, ValueError):
+            capacity = 0.0
+        if capacity > 0:
+            lines.append(f"You could pay up to {self._prose(capacity)} today and stay above your minimum.")
         else:
-            safe_today = float((result.get("decision") or {}).get("amount_safe_to_pay") or 0)
-            if safe_today > 0:
-                works.append(f"pay up to {money(safe_today, currency)} today")
-            earliest = situation.get("earliest_date_for_full_payment")
-            if earliest and earliest > self.as_of_date and "full_payment" in allowed:
-                works.append(f"or wait until {earliest} to pay the full amount")
-        if works:
-            joined = ", ".join(works[:-1]) + (f", or {works[-1]}" if len(works) > 1 else works[0])
-            lines.append(f"What works: {joined}.")
-        else:
-            lines.append("What works: nothing keeps you above your minimum within the 90-day forecast; "
-                         "a smaller amount or restored income would change this.")
-        # 5. Which accepted-method or deadline rule blocks a safe full payment.
+            lines.append("Right now no payment amount keeps you above your minimum without new income.")
+        # 6. Which accepted-method or deadline rule blocks a safe full payment.
         rules = []
         if full_safe and "full_payment" not in allowed:
-            rules.append((f"you told us you only consider {self._wait_methods_words()}", "Profile"))
+            rules.append(f"you told us you only consider {self._wait_methods_words()}")
         if not_recommended and self._unmet_deadline(result):
-            rules.append((f"nothing you consider completes by your deadline {self.form['pay_by_date']}",
-                          "Your deadline"))
-        for text, tag in rules:
-            lines.append(f"But {text}. [{tag}]")
+            rules.append(f"nothing you consider completes by your deadline {self.form['pay_by_date']}")
+        for text in rules:
+            lines.append(f"But {text}.")
         if not rules and not_recommended and full_safe:
             lines.append("But the decision engine did not select it for this request; the OPTIONS table shows it "
                          "as evidence.")
+        lines.append(self._based_on_line(result))
         return "\n".join(lines)
-
-    def _plan_words(self, result, chosen):
-        """Short name of the chosen (or earliest safe) plan for use in sentences."""
-        if chosen:
-            if chosen.get("type") == "installments":
-                return f"the {self.form.get('installment_count', 3)}-installment plan"
-            if chosen.get("type") == "wait":
-                return f"waiting until {max(chosen.get('dates') or ['the safe date'])}"
-            if chosen.get("type") == "partial_then_remainder":
-                entries = sorted(chosen.get("amounts", {}).items())
-                if entries:
-                    return (f"paying {self._fmt(entries[0][1])} now and the rest on "
-                            f"{max(chosen.get('dates') or ['a later date'])}")
-            return "paying in full today"
-        return "no plan"
 
     def render_report(self, result):
         currency = self.form["currency"]

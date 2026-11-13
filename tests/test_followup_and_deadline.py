@@ -80,6 +80,23 @@ def fake_dataset(tmp_path_factory):
             header = fh.readline()
         with open(os.path.join(base, name), "w") as fh:
             fh.write(header)
+    # Employer messages for the payroll-note and based-on tests. Retrieval
+    # hardcodes the real dataset, so the tests inject the retrieved message
+    # ids into the report's evidence themselves.
+    with open(os.path.join(base, "messages.csv"), "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["message_id", "user_id", "request_id", "related_event_id",
+                         "sent_at", "source_type", "message_text"])
+        writer.writerow(["message_fx_emp", "fx_inst12", "", "", "2024-08-29T09:30:00Z", "employer",
+                         "BrightPath Media has updated your payroll record. Your confirmed salary is now "
+                         "expected on 2024-09-23. Please use the revised date for anything you normally pay "
+                         "around payday. Payroll ref EMP-0099."])
+        writer.writerow(["message_fx_match", "fx_full", "", "", "2024-08-20T09:30:00Z", "employer",
+                         "BrightPath Media confirms your regular salary. The next payroll runs on 2024-09-15. "
+                         "Payroll ref EMP-0098."])
+        writer.writerow(["message_fx_future", "fx_all3", "", "", "2024-09-30T09:30:00Z", "employer",
+                         "BrightPath Media has updated your payroll record. Your confirmed salary is now "
+                         "expected on 2024-09-23. Payroll ref EMP-0097."])
     # No income_classes.csv: the classifier falls back without model calls.
     return base
 
@@ -314,12 +331,14 @@ def test_plain_why_and_why_not_now_use_distinct_evidence(fake_dataset):
     report = session.report
     rendered = session.render_report(report)
     why = rendered.split("WHY\n", 1)[1].split("\n\nNUMBERS", 1)[0]
-    assert "[Profile]" in why and "[Bank history]" in why
-    assert "[Income pattern]" in why
+    assert "[" not in why
     assert "No unsettled bank items affect this" in why
+    assert why.splitlines()[-1] == "Based on: your profile, your bank history and your salary pattern."
     not_now = session.handle("why not now")[0]["text"]
-    assert "would be safe" in not_now
-    assert "But you told us you only consider installments. [Profile]" in not_now
+    assert "Yes — you can pay the full ₹12,000 today." in not_now
+    assert "But you told us you only consider installments." in not_now
+    assert "[" not in not_now
+    assert not_now.splitlines()[-1] == why.splitlines()[-1]
     assert not_now != why
 
 
@@ -399,9 +418,9 @@ def test_not_recommended_why_has_no_unqualified_safe_claim(fake_dataset):
     _assistant, session = _session(fake_dataset)
     session.handle("Laptop 500k no deadline just advise")
     text = session.handle("why not now")[0]["text"]
-    assert "would not be safe" in text
+    assert "No — you cannot pay the full ₹500,000 today." in text
     assert "would be safe" not in text
-    assert "What works: pay up to INR 103,080.99 today." in text
+    assert "You could pay up to ₹103,081 today and stay above your minimum." in text
 
 
 def test_safe_but_profile_excluded_payment_is_disclosed(fake_dataset):
@@ -409,3 +428,135 @@ def test_safe_but_profile_excluded_payment_is_disclosed(fake_dataset):
     session.handle("Laptop 12k no deadline just advise")
     alternatives = session.render_report(session.report).split("ALTERNATIVES\n", 1)[1]
     assert "Paying in full today would be safe, but it isn't among the payment methods you accept." in alternatives
+
+
+def test_installment_chip_never_offers_the_verdict_count(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    session.handle("Laptop 12k no deadline just advise")  # verdict: 3 installments
+    labels = [label for label, _value in session.quick_replies()]
+    assert "Use 3 installments" not in labels     # never the count the verdict already uses
+    assert "Use 6 installments" in labels         # another count the profile allows
+    assert "/why" not in labels                   # the /why command stays, its chip is gone
+    assert "Why not now?" in labels
+    blocks = session.handle("6 installments")     # take the chip
+    assert any(block["kind"] == "report" for block in blocks)
+    labels = [label for label, _value in session.quick_replies()]
+    assert "Use 6 installments" not in labels
+    assert "Use 3 installments" in labels
+
+
+def test_installment_chip_never_offers_a_count_the_deadline_rules_out(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    # 3 monthly payments finish 2024-11-04, in time; 6 finish 2025-02-02, late.
+    session.handle("Can I pay ₹50,000 in 3 installments by 2024-11-15?")
+    labels = [label for label, _value in session.quick_replies()]
+    assert not any(label.startswith("Use ") for label in labels)  # 3 is the verdict, 6 misses
+    assert "Why not now?" in labels
+
+
+def test_chip_sets_follow_the_profile(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_full")
+    session.handle("Laptop 12k no deadline just advise")
+    assert [label for label, _value in session.quick_replies()] == ["Wait a month", "Why not now?"]
+
+    _assistant2, session2 = _session(fake_dataset, "fx_partial")
+    session2.handle("Laptop 12k no deadline just advise")
+    assert [label for label, _value in session2.quick_replies()] == ["Pay half now", "Why not now?"]
+
+    _assistant3, session3 = _session(fake_dataset, "fx_all3")
+    session3.handle("Laptop 12k no deadline just advise")
+    assert [label for label, _value in session3.quick_replies()] == [
+        "Pay half now", "Wait a month", "Use 3 installments", "Why not now?"]
+
+
+def test_count_question_states_the_deadline_note(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    session.handle("Laptop 12k")
+    session.handle("4")                 # pick a date
+    blocks = session.handle("2024-11-15")
+    prompt = blocks[-1]
+    assert prompt["text"] == (f"How many installments? [1 3 months (default)] "
+                              f"Only 3 monthly payments finish by 2024-11-15 "
+                              f"(a 6-month plan would end {COUNT6_DATE}).")
+    assert prompt["data"]["question"] == (f"How many installments? Only 3 monthly payments finish by "
+                                          f"2024-11-15 (a 6-month plan would end {COUNT6_DATE}).")
+
+
+def test_count_question_note_lists_every_eligible_count(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    session.handle("Can I pay ₹50,000 in installments by 2025-02-15?")
+    prompt = session.last_blocks[-1]["text"]
+    assert prompt == ("How many installments? [1 3 months (default), 2 6 months] "
+                      "Only 3 and 6 monthly payments finish by 2025-02-15 "
+                      "(a 12-month plan would end 2025-08-01).")
+
+
+def test_count_question_has_no_note_when_the_deadline_admits_every_count(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    session.handle("Can I pay ₹50,000 in installments by 2025-09-15?")
+    prompt = session.last_blocks[-1]["text"]
+    assert prompt == "How many installments? [1 3 months (default), 2 6 months, 3 12 months]"
+
+
+def test_why_and_why_not_now_are_clean_prose(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    session.handle("Laptop 12k no deadline just advise")
+    rendered = session.render_report(session.report)
+    why = rendered.split("WHY\n", 1)[1].split("\n\nNUMBERS", 1)[0]
+    assert "[" not in why and "]" not in why
+    lines = why.splitlines()
+    assert len(lines) >= 6  # short separate lines, not one run-on paragraph
+    assert "Before this payment," in why   # the baseline figure states its assumption
+    assert "₹" in why and "INR" not in why  # whole-number prose currency
+    assert " 2024-" not in why and " 2025-" not in why  # short dates like 13 Sep
+    assert " on 13 Sep" in why
+    assert lines[-1] == "Based on: your profile, your bank history and your salary pattern."
+    not_now = session.handle("why not now")[0]["text"]
+    nn_lines = not_now.splitlines()
+    assert nn_lines[0].startswith(("Yes —", "No —"))
+    assert nn_lines[1].startswith("If you pay it all today,")  # only the post-payment figure
+    assert any(line.startswith("Coming up:") for line in nn_lines)
+    assert any(line.startswith("Income:") for line in nn_lines)
+    # The safe line quotes the real room above the minimum, not the request-capped amount.
+    assert "You could pay up to ₹103,081 today and stay above your minimum." in not_now
+    assert "[" not in not_now
+    assert nn_lines[-1] == "Based on: your profile, your bank history and your salary pattern."
+
+
+def test_employer_payroll_mismatch_note_is_honest(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_inst12")
+    session.handle("Laptop 12k no deadline just advise")
+    report = session.report
+    report["evidence"]["retrieved_message_ids"] = ["message_fx_emp"]
+    rendered = session.render_report(report)
+    why = rendered.split("WHY\n", 1)[1].split("\n\nNUMBERS", 1)[0]
+    assert "Your employer says salary is now expected on 23 Sep; this forecast still assumes the 15th." in why
+    assert "confirms this income with an updated expected payroll date" not in why
+    assert why.splitlines()[-1] == ("Based on: your profile, your bank history and your salary pattern "
+                                    "and your employer's update EMP-0099.")
+    not_now = session.handle("why not now")[0]["text"]
+    assert "Your employer says salary is now expected on 23 Sep; this forecast still assumes the 15th." in not_now
+    assert "and your employer's update EMP-0099." in not_now.splitlines()[-1]
+
+
+def test_employer_message_agreeing_with_forecast_gets_no_mismatch_note(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_full")
+    session.handle("Laptop 12k no deadline just advise")
+    report = session.report
+    report["evidence"]["retrieved_message_ids"] = ["message_fx_match"]
+    rendered = session.render_report(report)
+    why = rendered.split("WHY\n", 1)[1].split("\n\nNUMBERS", 1)[0]
+    assert "Your employer's message EMP-0098 agrees with the salary date this forecast assumes." in why
+    assert "now expected on" not in why
+    assert why.splitlines()[-1].endswith("and your employer's update EMP-0098.")
+
+
+def test_employer_message_sent_after_as_of_is_ignored(fake_dataset):
+    _assistant, session = _session(fake_dataset, "fx_all3")
+    session.handle("Laptop 12k no deadline just advise")
+    report = session.report
+    report["evidence"]["retrieved_message_ids"] = ["message_fx_future"]
+    rendered = session.render_report(report)
+    why = rendered.split("WHY\n", 1)[1].split("\n\nNUMBERS", 1)[0]
+    assert "employer" not in why.lower()
+    assert why.splitlines()[-1] == "Based on: your profile, your bank history and your salary pattern."

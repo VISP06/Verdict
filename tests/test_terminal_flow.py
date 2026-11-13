@@ -258,9 +258,13 @@ def test_not_recommended_why_has_no_unqualified_safe_claim():
     session.handle("Laptop 500000 no deadline just advise")
     assert "NOT RECOMMENDED" in render_headline(session)
     text = session.handle("why not now")[0]["text"]
-    assert "would not be safe" in text
+    assert "No — you cannot pay the full ₹500,000 today." in text
     assert "would be safe" not in text
-    assert "What works: pay up to INR 103,080.99 today." in text
+    assert "below your minimum" in text
+    assert "You could pay up to ₹103,081 today and stay above your minimum." in text
+    assert "[" not in text
+    assert text.splitlines()[-1] == ("Based on: your profile, your bank history and your salary pattern "
+                                     "and your employer's update EMP-0005.")
 
 
 def test_why_not_now_names_the_rule_that_blocks_a_safe_payment():
@@ -269,8 +273,9 @@ def test_why_not_now_names_the_rule_that_blocks_a_safe_payment():
     session = TerminalSession("user_07")
     session.handle("Laptop 12000 no deadline just advise")
     text = session.handle("why not now")[0]["text"]
-    assert "would be safe:" in text
-    assert "But you told us you only consider installments. [Profile]" in text
+    assert "Yes — you can pay the full ₹12,000 today." in text
+    assert "But you told us you only consider installments." in text
+    assert "[" not in text
 
 
 def test_why_not_now_names_the_deadline_rule_when_it_blocks_the_plan():
@@ -286,8 +291,9 @@ def test_why_not_now_names_the_deadline_rule_when_it_blocks_the_plan():
     session.form["pay_by_date"] = "2025-05-14"
     assert "NOT RECOMMENDED" in render_headline(session)
     text = session._why_not_now_text()
-    assert "would be safe:" in text
-    assert ("But nothing you consider completes by your deadline 2025-05-14. [Your deadline]" in text)
+    assert "Yes — you can pay the full R8,000 today." in text
+    assert "But nothing you consider completes by your deadline 2025-05-14." in text
+    assert "[" not in text
 
 
 def render_headline(session):

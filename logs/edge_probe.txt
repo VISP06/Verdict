@@ -1,0 +1,149 @@
+
+=== /date ===
+[text] Usage: /date YYYY-MM-DD
+
+=== /user ===
+[text] Usage: /user <id>
+
+=== user_07 $100 ack ===
+[text] Got it: INR 8,333.00 · laptop · no deadline. $100 = ₹8,333 (rate 83.33).
+
+=== user_07 $100 report ===
+[report] ╭─ PAY IN 3 INSTALLMENTS ─╮
+WHY
+You have ₹218,946 available today and want to keep at least ₹93,000 free.
+Before this payment, the lowest balance in the next 90 days is about ₹218,946 on 4 Nov.
+No recurring income is counted in this forecast.
+Your employer's message EMP-0005 agrees with the salary date this forecast assumes.
+Paying ₹8,333 in 3 installments would take you to ₹210,613 on 3 Jan, ₹117,613 above your minimum, so the plan stays safe.
+No unsettled bank items affect this.
+Based on: your profile, your bank history and your salary pattern and your employer's update EMP-0005.
+
+NUMBERS
+90-day balance: ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+Minimum-balance level: INR 93,000.00
+2025-11-04 INR 218,945.56 → 2026-02-02 INR 218,945.56
+
+OPTIONS
+OPTION                 WHEN                 TOTAL COST       LOWEST BALANCE   MEETS DEADLINE   SAFE
+pay in full now        2025-11-04           INR 8,333.00     INR 210,612.56   n/a   ✓ SAFE
+installments           2025-11-04, 2025-12-04, 2026-01-03 INR 8,333.00     INR 210,612.56   n/a   ✓ SAFE
+
+ALTERNATIVES
+• Paying in full today would be safe, but it isn't among the payment methods you accept.
+
+NEXT STEPS
+• Confirm the 3-installment plan for INR 8,333.00.
+• Ensure sufficient funds on each monthly due date while maintaining INR 93,000.00.
+• Recheck the forecast before making each scheduled payment.
+╰─────────────────────────╯ options=[None, None]
+form: {'amount': 8333.0, 'currency': 'INR'}
+
+=== user_07 $100 intake ack ===
+[text] Got it: INR 8,333.00 · laptop · installments · no deadline given yet. $100 = ₹8,333 (rate 83.33).
+[text] Your profile only allows installments.
+[prompt] When do you need to pay? [1 none (default), 2 within 14 days, 3 end of this month, 4 type YYYY-MM-DD] options=['No deadline', 'Within 14 days', 'By the end of this month', 'Pick a date…']
+
+=== user_07 $100 report (head) ===
+[report] ╭─ PAY IN 3 INSTALLMENTS ─╮
+
+=== boundary report (OPTIONS + WHY result lines) ===
+OPTION                 WHEN                 TOTAL COST       LOWEST BALANCE   MEETS DEADLINE   SAFE
+partial then remainder 2024-09-04, 2024-09-15 INR 100,000.00   INR 93,000.00    n/a   ✓ SAFE
+installments           2024-09-04, 2024-10-04, 2024-11-03 INR 100,000.00   INR 94,347.66    n/a   ✓ SAFE
+pay in full now        2024-09-04           INR 100,000.00   INR 27,680.99    n/a   ✗ UNSAFE
+                         Note: (drops to INR 27,680.99 on 2024-09-13, INR 65,319.01 below the minimum)
+boundary '0.00 below' present: False
+
+=== typed today deadline ===
+[text] No installment plan can finish by 2025-11-04; the shortest plan ends on 2026-01-03, after the deadline.
+[prompt] The selected installment plan ends 2026-01-03, after that deadline. Choose 1 none, or type a date on or after 2026-01-03. options=['Remove the deadline']
+
+=== count menu after removal ===
+[report] ╭─ PAY IN 3 INSTALLMENTS ─╮
+WHY
+You have ₹218,946 available today and want to keep at least ₹93,000 free.
+Before this payment, the lowest balance in the next 90 days is about ₹218,946 on 4 Nov.
+No recurring income is counted in this forecast.
+Your employer's message EMP-0005 agrees with the salary date this forecast assumes.
+Paying ₹12,000 in 3 installments would take you to ₹206,946 on 3 Jan, ₹113,946 above your minimum, so the plan stays safe.
+No unsettled bank items affect this.
+Based on: your profile, your bank history and your salary pattern and your employer's update EMP-0005.
+
+NUMBERS
+90-day balance: ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+Minimum-balance level: INR 93,000.00
+2025-11-04 INR 218,945.56 → 2026-02-02 INR 218,945.56
+
+OPTIONS
+OPTION                 WHEN                 TOTAL COST       LOWEST BALANCE   MEETS DEADLINE   SAFE
+pay in full now        2025-11-04           INR 12,000.00    INR 206,945.56   n/a   ✓ SAFE
+installments           2025-11-04, 2025-12-04, 2026-01-03 INR 12,000.00    INR 206,945.56   n/a   ✓ SAFE
+
+ALTERNATIVES
+• Paying in full today would be safe, but it isn't among the payment methods you accept.
+
+NEXT STEPS
+• Confirm the 3-installment plan for INR 12,000.00.
+• Ensure sufficient funds on each monthly due date while maintaining INR 93,000.00.
+• Recheck the forecast before making each scheduled payment.
+╰─────────────────────────╯ options=[None, None]
+
+=== in-sentence today ===
+[text] Got it: INR 12,000.00 · laptop pay · installments · pay by 2025-11-04.
+[text] Your profile only allows installments.
+[text] No installment plan can finish by 2025-11-04; the shortest plan ends on 2026-01-03, after the deadline.
+[prompt] The selected installment plan ends 2026-01-03, after that deadline. Choose 1 none, or type a date on or after 2026-01-03. options=['Remove the deadline']
+
+=== user_33 6 installments ===
+[text] Got it: INR 50,000.00 · no deadline.
+[text] Your profile doesn't include installments, so I'll use paying in full instead.
+[report] ╭─ NOT RECOMMENDED: no option keeps your balance above the minimum ─╮
+WHY
+You have ₹167,280 available today and want to keep at least ₹102,100 free.
+Before this payment, the lowest balance in the next 90 days is about ₹88,300 on 14 Nov, after your shopping, groceries and eating out go out.
+Counted income: your salary of ₹50,000 lands on the 15th and your salary of ₹50,000 lands on the 15th and your salary of ₹150,000 lands on the 15th each month.
+Paying ₹50,000 in full now would take you to ₹38,300 on 14 Nov, ₹63,800 below your minimum, so the full payment does not fit in the next 90 days.
+No unsettled bank items affect this.
+Based on: your profile, your bank history and your salary pattern.
+
+NUMBERS
+90-day balance: ▂▂▂▂▂▂▂▂▁▁▁▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▄▄▄▄▄▃▃▃▃▃▃▃▃███████████▇▇▇▇▇▇▇▆▆▆▆▅▅▅▅▅▅▅▅▅████▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇
+Minimum-balance level: INR 102,100.00
+2025-11-04 INR 166,751.83 → 2026-02-02 INR 399,499.59
+
+OPTIONS
+OPTION                 WHEN                 TOTAL COST       LOWEST BALANCE   MEETS DEADLINE   SAFE
+pay in full now        2025-11-04           INR 50,000.00    INR 38,299.66    n/a   ✗ UNSAFE
+                         Note: (drops to INR 38,299.66 on 2025-11-14, INR 63,800.34 below the minimum)
+wait                   2025-11-15           INR 50,000.00    INR 88,299.66    n/a   ✗ UNSAFE
+                         Note: (drops to INR 88,299.66 on 2025-11-14, INR 13,800.34 below the minimum)
+
+ALTERNATIVES
+• Earliest safe date to wait for: 2025-11-15.
+
+NEXT STEPS
+• Do not make this payment now
+• Earliest safe date: 2025-11-15.
+• This answer could change if income resumes, you choose a smaller amount, or spending changes (none).
+╰───────────────────────────────────────────────────────────────────╯ options=[None, None]
+form: {'amount': 50000.0, 'currency': 'INR', 'item': 'pay . in installments', 'allow_partial': False, 'allow_installments': False, 'installment_count': 3, 'installment_fee_pct': 0.0, 'pay_by_date': None, 'partial_declined': True, 'installments_declined': True}
+
+=== -500 ===
+[error] Amounts must be positive; please enter an amount above zero.
+
+=== beyond 90 days ===
+[text] That date is beyond the 90-day forecast ending 2026-02-02; I'll use no deadline instead.
+[prompt] How would you like to pay? [1 Let Verdict decide (default), 2 Pay in full today, 3 Pay part now and the rest later, 4 Pay in installments] options=['Let Verdict decide', 'Pay in full today', 'Pay part now and the rest later', 'Pay in installments']
+pay_by_date: None
+
+=== empty after report ===
+[text] Type a request or a follow-up.
+
+=== user_12 24 installments (head) ===
+[report] ╭─ PAY IN 11 INSTALLMENTS ─╮
+form count: 11
+
+=== user_02 24 installments (head) ===
+[report] ╭─ PAY IN 7 INSTALLMENTS ─╮
+form count: 7

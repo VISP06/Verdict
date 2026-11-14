@@ -190,7 +190,7 @@ def test_followup_without_compliant_plan_asks_conflict_question(fake_dataset):
 def test_no_plan_completes_by_deadline_so_conflict_question_replaces_menu(fake_dataset):
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Can I pay ₹50,000 in installments by 2024-09-20?")
-    assert any("No installment option completes by 2024-09-20" in block["text"] for block in blocks)
+    assert any("No installment plan can finish by 2024-09-20" in block["text"] for block in blocks)
     prompt = blocks[-1]
     assert "after that deadline" in prompt["text"]
     assert session.questions == ["deadline_conflict"]
@@ -231,14 +231,18 @@ def test_conflict_prompt_offers_full_payment_only_when_profile_allows(fake_datas
     labels = [option["label"] for option in blocks[-1]["data"]["options"]]
     assert labels == ["Remove the deadline"]
 
+    # A profile without installments never reaches the conflict question: the
+    # named method is refused at intake and the allowed method is used instead.
     _assistant2, session2 = _session(fake_dataset, "fx_full")
     blocks2 = session2.handle("Can I pay ₹50,000 in 6 installments by 2024-09-20?")
-    options2 = blocks2[-1]["data"]["options"]
-    assert [option["label"] for option in options2] == ["Remove the deadline", "Pay in full today instead"]
-    blocks2 = session2.handle("2")  # take the option that meets the deadline
+    joined2 = " ".join(block["text"] for block in blocks2)
+    assert "Your profile doesn't include installments, so I'll use paying in full instead." in joined2
+    ack2 = next(block["text"] for block in blocks2 if block["text"].startswith("Got it:"))
+    assert "6 installments" not in ack2
+    assert not any(block["kind"] == "prompt" for block in blocks2)
+    assert "PAY IN FULL TODAY" in blocks2[-1]["text"]
     assert session2.form["pay_by_date"] == "2024-09-20"  # the deadline is kept
     assert session2.form["allow_installments"] is False
-    assert "PAY IN FULL TODAY" in blocks2[-1]["text"]
 
 
 def test_installments_not_mentioned_before_asking_when_not_chosen(fake_dataset):
@@ -249,7 +253,7 @@ def test_installments_not_mentioned_before_asking_when_not_chosen(fake_dataset):
     assert session.form["pay_by_date"] == "2024-09-30"
     joined = " ".join(block["text"] for block in blocks)
     assert "Your profile only allows installments." in joined
-    assert "No installment option completes by" in joined
+    assert "No installment plan can finish by" in joined
     assert "How many installments?" not in joined
     blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
     assert session.form["pay_by_date"] is None
@@ -260,14 +264,14 @@ def test_installments_not_mentioned_before_asking_when_not_chosen(fake_dataset):
 
 def test_deadline_question_answer_does_not_pre_filter_unchosen_installments(fake_dataset):
     # Deadline answered as a question with no method chosen: no
-    # "No installment option completes by..." message before asking.
+    # "No installment plan can finish by..." message before asking.
     _assistant, session = _session(fake_dataset, "fx_all3")
     session.handle("Laptop 12k")
     blocks = session.handle("2")  # within 14 days -> 2024-09-19
-    assert not any("No installment option completes by" in block["text"] for block in blocks)
+    assert not any("No installment plan can finish by" in block["text"] for block in blocks)
     assert "How would you like to pay?" in blocks[-1]["text"]
     blocks = session.handle("4")  # installments chosen -> conflict raised at once
-    assert any("No installment option completes by 2024-09-19" in block["text"] for block in blocks)
+    assert any("No installment plan can finish by 2024-09-19" in block["text"] for block in blocks)
     blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
     assert session.form["pay_by_date"] is None
     assert "How many installments?" in blocks[-1]["text"]

@@ -1,0 +1,66 @@
+Interactive-flow edge-case verification results
+===============================================
+Repo: /home/vishruth/orchestrate_agent
+Date: 2026-11-14
+Scope: code/terminal_flow.py only (no changes to forecast.py, financial_engine.py,
+main.py batch logic, evaluation/, output.csv, dataset/).
+
+--- 1. Focused edge tests (tests/test_terminal_flow.py, -k selection) ---
+
+$ python -m pytest tests/test_terminal_flow.py -q -k "currency or boundary_partial or zero_shortfall or beats_the_count_menu or in_sentence_today or refuses_named_installments or falls_back_to_a_safe_full_payment or above_cap or user_date_usage or ambiguous_and_negative or unrecognized_or_empty or typed_deadline_validation"
+......................                                                   [100%]
+22 passed, 86 deselected in 17.20s
+
+Covered behaviors:
+  * /date with no argument prints "Usage: /date YYYY-MM-DD"
+  * Foreign currency converted once; WHY/NUMBERS/OPTIONS stay in account
+    currency; conversion note line "$100 = ₹8,333 (rate 83.33)"
+  * Missing-rate foreign currency keeps the home-amount question path
+  * Foreign-currency amendment ("make it 200") is converted too
+  * _floor_cents: safest partial amount / capacities never exceed the floor
+  * Balance exactly equal to the minimum is SAFE (boundary partial plan
+    lands on the minimum)
+  * Unsafe note never claims a "0.00 below the minimum" shortfall
+  * Typed deadline too short for any plan → conflict question BEFORE the
+    count menu; in-sentence "today" deadline behaves the same
+  * Profile without installments refuses named installments ("Your profile
+    doesn't include installments, so I'll use paying in full instead.")
+    and falls back to a safe full payment
+  * Explicit installments above the cap (24 -> 11/12) yield the capped plan
+    as the verdict, both as first request and as follow-up
+  * "-500" wording: "Amounts must be positive; please enter an amount
+    above zero."
+  * Deadline beyond the 90-day window names the date actually used
+    ("beyond the 90-day forecast ending 2026-02-02")
+  * Empty input after a report: "Type a request or a follow-up."
+
+--- 2. Full test suite ---
+
+$ python -m pytest tests -q
+207 passed in 243.99s (0:04:03)
+exit=0
+
+--- 3. Evaluation gate (must be exactly 76/88/80/8/68) ---
+
+$ python evaluation/evaluate.py
+
+Income coverage: 37 of 37 series LLM-classified, 0 using fallback
+
+Per-column accuracy:
+  affordability_status: 76.00%
+  recommended_payment_method: 88.00%
+  payment_plan: 80.00%
+  amount_safe_to_pay: 8.00%
+  earliest_date_for_full_payment: 68.00%
+
+(scores identical to the pre-change baseline; the non-zero exit code is by
+design - evaluate.py returns 1 whenever any mismatch exists, unchanged)
+
+--- 4. Output validation gate ---
+
+$ python evaluation/validate_output.py output.csv dataset/requests.csv
+No violations.
+exit=0
+
+All gates hold. See logs/edge_probe.txt for the end-to-end interactive
+transcript demonstrating each fixed behavior.

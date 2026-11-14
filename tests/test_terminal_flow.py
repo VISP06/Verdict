@@ -114,7 +114,7 @@ def test_deadline_filters_installments_and_conflicting_deadline_reasks():
     assert "How would you like to pay?" in blocks[-1]["text"]
     blocks = session.handle("4")  # installments chosen: the pending count question
                                   # is replaced by the deadline conflict at once
-    assert any("No installment option completes by" in block["text"] for block in blocks)
+    assert any("No installment plan can finish by" in block["text"] for block in blocks)
     blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
     assert session.form["pay_by_date"] is None
     assert "How many installments?" in blocks[-1]["text"]
@@ -152,10 +152,10 @@ def test_deadline_answer_filters_later_installments_and_why_users_are_evidence_b
     session, _ = start("Laptop costs 12k")
     blocks = session.handle("3")  # end of this month
     # No installments chosen yet: no conflict message, the intake continues.
-    assert not any("No installment option completes by" in block["text"] for block in blocks)
+    assert not any("No installment plan can finish by" in block["text"] for block in blocks)
     assert "How would you like to pay?" in blocks[-1]["text"]
     blocks = session.handle("4")  # installments chosen: conflict raised at once
-    assert any("No installment option completes by" in block["text"] for block in blocks)
+    assert any("No installment plan can finish by" in block["text"] for block in blocks)
 
     demo = TerminalSession("user_07", "2025-11-04")
     assert demo.assistant.engine.get_user_home_currency("user_07") == "INR"
@@ -200,9 +200,12 @@ def test_unrecognized_or_empty_report_followup_never_reprints_report(line):
     assert not any(block["kind"] == "report" for block in blocks)
     if line:
         assert "I didn't understand that." in blocks[0]["text"]
+    else:
+        # Empty input after a report asks for the next step instead of silence.
+        assert blocks[0]["text"] == "Type a request or a follow-up."
 
 
-@pytest.mark.parametrize(("command", "expected"), [("/user", "Usage: /user <id>"), ("/date", "Usage: /user <id>")])
+@pytest.mark.parametrize(("command", "expected"), [("/user", "Usage: /user <id>"), ("/date", "Usage: /date YYYY-MM-DD")])
 def test_user_date_usage(command, expected):
     session = TerminalSession("user_07", "2025-11-04")
     assert session.handle(command)[0]["text"] == expected
@@ -337,7 +340,7 @@ def test_ambiguous_and_negative_amount_messages_and_large_amount_warning():
     session = TerminalSession("user_07", "2025-11-04")
     assert "Which amount did you mean: INR 12,000.00 or INR 5,000.00?" in session.handle("12k and 5k")[0]["text"]
     assert session.handle("12k")[-1]["kind"] == "prompt"
-    assert "positive" in session.handle("-500")[0]["text"]
+    assert session.handle("-500")[0]["text"] == "Amounts must be positive; please enter an amount above zero."
     large_session = TerminalSession("user_07", "2025-11-04")
     large_session.handle("1500 bn no deadline just advise")
     assert any("above 1,000,000,000,000" in block["text"] for block in large_session.last_blocks)
@@ -353,7 +356,9 @@ def test_typed_deadline_validation_table(answer):
         assert any("on or after" in block["text"] for block in session.last_blocks)
     elif answer == "2026-02-10":
         assert session.form.get("pay_by_date") is None
-        assert any("beyond the 90-day forecast" in block["text"] for block in session.last_blocks)
+        # The message names the window end it falls back to, not a vague promise.
+        assert any("beyond the 90-day forecast ending 2026-02-02" in block["text"]
+                   and "no deadline" in block["text"] for block in session.last_blocks)
     else:
         assert session.form.get("pay_by_date") in {"2025-11-06", "2025-11-18"}
 
@@ -584,3 +589,150 @@ def test_acknowledgement_is_escaped_and_shown_once_per_request():
     assert "<b>laptop</b>" not in acks[0]["text"]
     followup_blocks = session.handle("")  # answering a question never re-acknowledges
     assert followup_blocks and not any(block["text"].startswith("Got it:") for block in followup_blocks)
+
+
+# --- Mixed currencies: everything after the request stays in the account currency ---
+
+def test_foreign_currency_request_is_converted_once_and_shown_in_account_currency():
+    session = TerminalSession("user_07", "2025-11-04")  # INR account
+    blocks = session.handle("Laptop $100 no deadline just advise")
+    ack = blocks[0]["text"]
+    assert ack.startswith("Got it: INR 8,333.00")
+    assert "$100 = ₹8,333 (rate 83.33)" in ack
+    # The form is normalized to the account currency after one conversion.
+    assert session.form["amount"] == 8333.0
+    assert session.form["currency"] == "INR"
+    report = blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ PAY IN 3 INSTALLMENTS ─╮"
+    # No "$" on INR balances and no "USD" label on INR amounts anywhere.
+    assert "$" not in report
+    assert "USD" not in report
+    assert "INR 8,333.00" in report          # OPTIONS total cost
+    assert "Minimum-balance level: INR 93,000.00" in report
+    assert "You have ₹218,946 available today" in report
+
+
+def test_foreign_currency_request_without_a_rate_keeps_the_home_amount_question():
+    session = TerminalSession("user_05", "2025-11-04")  # ZAR account, no INR rate
+    blocks = session.handle("Laptop Rs 100 no deadline just advise")
+    ack = blocks[0]["text"]
+    assert ack.startswith("Got it: INR 100.00")
+    assert "=" not in ack  # nothing was converted, so no conversion line
+    assert blocks[-1]["kind"] == "error"
+    assert ("Your account is in ZAR and I have no INR to ZAR rate. Type the amount in "
+            "ZAR, or switch accounts with /user.") == blocks[-1]["text"]
+
+
+def test_foreign_currency_amendment_is_converted_too():
+    session = TerminalSession("user_07", "2025-11-04")
+    session.handle("Laptop 12k no deadline just advise")
+    session.handle("actually $100")
+    assert session.form["amount"] == 8333.0
+    assert session.form["currency"] == "INR"
+
+
+# --- Safe-limit boundary: exactly at the minimum is safe; no "0.00 below" contradictions ---
+
+def test_safest_partial_amount_never_exceeds_capacity(monkeypatch):
+    session = TerminalSession("user_07", "2025-11-04")
+    session.form = {"amount": 50000.0, "currency": "INR", "pay_by_date": None}
+    monkeypatch.setattr(session.assistant, "situation", lambda: {
+        "lowest_projected_balance": 93000.0 + 1234.567, "minimum_balance": 93000.0})
+    # Rounded up it would leave the balance below the minimum; floored it is safe.
+    assert session._safest_partial_amount() == 1234.56
+
+
+def test_boundary_partial_plan_lands_on_the_minimum_and_is_safe():
+    session = TerminalSession("user_07", "2024-09-04")
+    session.handle("Laptop costs 100k no deadline pay half now just advise")
+    option = next(item for item in session.report["ranked_options"]
+                  if item["type"] == "partial_then_remainder")
+    assert option["safe"] is True
+    assert option["lowest_projected_balance"] == session.report["situation"]["minimum_balance"]
+    rendered = session.render_report(session.report)
+    assert "0.00 below the minimum" not in rendered
+
+
+def test_unsafe_note_never_claims_a_zero_shortfall():
+    session = TerminalSession("user_07", "2025-11-04")
+    session.handle("Laptop 12k no deadline just advise")
+    result = session.report
+    result["decision"]["affordability_status"] = "not_affordable"
+    result["recommended_option"] = None
+    minimum = result["situation"]["minimum_balance"]
+    option = result["ranked_options"][0]
+    option["safe"] = False
+    option["lowest_projected_balance"] = minimum - 0.003  # a hair under, displays equal
+    rendered = session.render_report(result)
+    assert "0.00 below the minimum" not in rendered
+    assert "just under the minimum" in rendered
+
+
+# --- Deadline today / too short for any installment count, before the count menu ---
+
+def test_typed_deadline_too_short_for_any_plan_beats_the_count_menu():
+    session = TerminalSession("user_07", "2025-11-04")
+    blocks = session.handle("Laptop 12k")
+    session.handle("4")                   # pick a date
+    blocks = session.handle("2025-11-04")  # deadline = today
+    joined = " ".join(block["text"] for block in blocks)
+    assert "No installment plan can finish by 2025-11-04" in joined
+    assert "How many installments?" not in joined
+    assert "deadline_conflict" in session.questions
+    blocks = session.handle("1")          # remove the deadline -> the count is asked
+    assert session.form["pay_by_date"] is None
+    assert "How many installments?" in blocks[-1]["text"]
+
+
+def test_in_sentence_today_deadline_conflicts_like_any_other_date():
+    session = TerminalSession("user_07", "2025-11-04")
+    blocks = session.handle("Laptop 12k pay by today")
+    joined = " ".join(block["text"] for block in blocks)
+    assert session.form["pay_by_date"] == "2025-11-04"
+    assert "No installment plan can finish by 2025-11-04" in joined
+    assert "How many installments?" not in joined
+
+
+# --- A method the profile doesn't allow is refused with a fallback, not echoed ---
+
+def test_profile_without_installments_refuses_named_installments():
+    session = TerminalSession("user_33", "2025-11-04")  # full + partial, no installments
+    blocks = session.handle("Can I pay Rs. 50,000 in 6 installments no deadline just advise")
+    ack = blocks[0]["text"]
+    assert ack.startswith("Got it: INR 50,000.00")
+    assert "6 installments" not in ack
+    joined = " ".join(block["text"] for block in blocks)
+    assert "Your profile doesn't include installments, so I'll use paying in full instead." in joined
+    assert session.questions == []          # no count question
+    assert session.form["allow_installments"] is False
+    options = session.report_data(session.report)["options"]
+    assert all(row["name"] != "installments" for row in options)
+
+
+def test_profile_without_installments_falls_back_to_a_safe_full_payment():
+    session = TerminalSession("user_06")  # full + partial allowed, no installments
+    blocks = session.handle("Laptop 200 in 6 installments no deadline just advise")
+    assert "Your profile doesn't include installments, so I'll use paying in full instead." in \
+        " ".join(block["text"] for block in blocks)
+    assert "PAY IN FULL TODAY" in blocks[-1]["text"]
+
+
+# --- Capped installments: the verdict is the capped plan when it is safe ---
+
+def test_explicit_installments_above_cap_verdict_uses_the_capped_count():
+    session = TerminalSession("user_12", "2025-11-04")  # cap 11
+    blocks = session.handle("Laptop 12k in 24 installments no deadline just advise")
+    joined = " ".join(block["text"] for block in blocks)
+    assert "Your profile allows at most 11 installments; using 11." in joined
+    assert "How many installments?" not in joined
+    assert blocks[-1]["text"].split("\n", 1)[0] == "╭─ PAY IN 11 INSTALLMENTS ─╮"
+
+
+def test_explicit_installments_above_cap_as_followup_keeps_the_capped_verdict():
+    session = TerminalSession("user_07", "2025-11-04")  # cap 12
+    session.handle("Laptop 12k no deadline just advise")
+    blocks = session.handle("24 installments")
+    assert any("Your profile allows at most 12 installments; using 12." in block["text"]
+               for block in blocks)
+    assert any(block["kind"] == "report" for block in blocks)
+    assert blocks[-1]["text"].split("\n", 1)[0] == "╭─ PAY IN 12 INSTALLMENTS ─╮"

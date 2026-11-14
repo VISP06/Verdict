@@ -3,6 +3,7 @@
 import datetime as dt
 import calendar
 import html
+import math
 import os
 import re
 
@@ -157,6 +158,7 @@ class TerminalSession:
         self._no_change_reason_cached = None
         self._partial_safest_cache = None
         self._fee_invalid = False
+        self._conversion_note = None
 
     @property
     def as_of_note(self):
@@ -207,7 +209,7 @@ class TerminalSession:
 
     def _installment_deadline_message(self, deadline):
         earliest = installment_completion_date(self.as_of_date, min(self.installment_counts))
-        return (f"No installment option completes by {deadline}; the shortest plan ends "
+        return (f"No installment plan can finish by {deadline}; the shortest plan ends "
                 f"on {earliest}, after the deadline.")
 
     def _has_installment_conflict(self, deadline):
@@ -333,7 +335,9 @@ class TerminalSession:
             capacity = max(0.0, float(situation["lowest_projected_balance"]) - float(situation["minimum_balance"]))
         except Exception:
             capacity = 0.0
-        value = round(min(amount, capacity), 2)
+        # Floor to cents: a rounded-up "safest" amount would leave the balance a
+        # fraction below the minimum and contradict the safe claim.
+        value = self._floor_cents(min(amount, capacity))
         self._partial_safest_cache = value
         return value
 
@@ -355,7 +359,7 @@ class TerminalSession:
             del self._forced_amount
         if amount is None:
             if re.search(r"(?<!\w)-\s*\d", line):
-                return [self._block("error", "Amounts must be positive; please enter a non-negative amount.")]
+                return [self._block("error", "Amounts must be positive; please enter an amount above zero.")]
             text = "What amount are you considering?"
             return [self._block("prompt", text, {"question": text, "options": []})]
         self.request_text = line
@@ -365,6 +369,10 @@ class TerminalSession:
                      "allow_partial": False, "allow_installments": False,
                      "installment_count": 3, "installment_fee_pct": 0.0}
         self._partial_safest_cache = None
+        self._conversion_note = None
+        # A request in another currency is converted once into the account
+        # currency; every figure afterwards is shown in the account currency.
+        self._normalize_currency()
         lowered = line.lower()
         self.questions = []
         self._installment_count_given = False
@@ -383,7 +391,18 @@ class TerminalSession:
             self.form["installment_fee_pct"] = float(fee_match.group(1))
         just_advise = bool(re.search(r"\bjust advise\b", lowered))
         statement = None
-        if count:
+        if (count or inst_named) and not self._profile_allows_installments():
+            # The user named a method the profile excludes: say so, keep the
+            # fallback method, and never echo the count or offer the plan.
+            if self._pay_methods()[0] == "partial_payment":
+                self.form["allow_partial"] = True
+            else:
+                self.form["partial_declined"] = True
+            self.form["allow_installments"] = False
+            self.form["installments_declined"] = True
+            statement = (f"Your profile doesn't include installments, "
+                         f"so I'll use {self._only_method_words()} instead.")
+        elif count:
             self.form.update(allow_installments=True, installment_count=int(count.group(1)),
                              allow_partial=False)
             self._installment_count_given = True
@@ -402,7 +421,7 @@ class TerminalSession:
             self.form["allow_partial"] = True
             self.form["allow_installments"] = False
             if "pay half now" in lowered:
-                self.form["partial_amount"] = amount * 0.5
+                self.form["partial_amount"] = self.form["amount"] * 0.5
             else:
                 self.questions.append("partial_amount")
         elif full_named or declined_inst:
@@ -471,13 +490,16 @@ class TerminalSession:
             item = re.split(r"\b(?:worth|costing|costs?|by|i will|i'll|without|no installments?|that)\b", item, maxsplit=1, flags=re.I)[0]
             item = re.sub(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|Rs\.?)\b)\s*", "", item, flags=re.I)
             item = re.sub(r"\b\d[\d,.]*(?:\s*(?:k|thousand|lakh|lakhs|lac|lacs|crore|crores))?\b", "", item, flags=re.I)
-            item = re.sub(r"\b(?:no deadline|no due date|just advise|in full|pay in full|pay half now)\b", "", item, flags=re.I)
+            item = re.sub(r"\b(?:no deadline|no due date|just advise|in full|pay in full|pay half now|today)\b", "", item, flags=re.I)
         item = re.sub(r"\b(?:a|an|the)\b", "", item, flags=re.I)
         return re.sub(r"\s+", " ", item).strip(" ?.!,$") .lower() or "payment"
 
     def _parse_deadline(self, text):
         if re.search(r"\b(no deadline|no due date|just advise)\b", text, re.I):
             self.form["pay_by_date"] = None
+            return True
+        if re.search(r"\btoday\b", text, re.I):
+            self.form["pay_by_date"] = self.as_of_date
             return True
         iso = re.search(r"\b(20\d\d-\d\d-\d\d)\b", text)
         if iso:
@@ -530,7 +552,12 @@ class TerminalSession:
             parts.append("no deadline")
         else:
             parts.append("no deadline given yet")
-        self._block("text", " · ".join(parts) + ".")
+        text = " · ".join(parts) + "."
+        note = getattr(self, "_conversion_note", None)
+        if note:
+            # A request in another currency is stated once, in both currencies.
+            text = f"{text} {note}."
+        self._block("text", text)
 
     def _accept_answer(self, line):
         key = self.questions[self.question_index]
@@ -617,7 +644,9 @@ class TerminalSession:
             parsed = dt.date.fromisoformat(value) if value else None
             if parsed and parsed > dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90):
                 self.form["pay_by_date"] = None
-                self._block("text", "That date is beyond the 90-day forecast; I'll show the earliest safe date instead.")
+                window_end = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
+                self._block("text", f"That date is beyond the 90-day forecast ending {window_end}; "
+                                    f"I'll use no deadline instead.")
             else:
                 self.form["pay_by_date"] = parsed.isoformat() if parsed else None
         elif key == "method":
@@ -654,7 +683,7 @@ class TerminalSession:
         elif key == "partial_amount":
             applied = min(float(partial_now), float(self.form["amount"]))
             safest = self._safest_partial_amount()
-            if applied > safest + 0.005:
+            if applied > safest + 1e-9:
                 applied = safest
                 self._block("text", f"Only {self._fmt(safest)} is safe to pay today; using it.")
             self.form["allow_partial"] = True
@@ -675,11 +704,12 @@ class TerminalSession:
             self._block("text", f"The selected installment plan conflicts with the deadline {self.form['pay_by_date']}.")
             self._prompt()
             return self.last_blocks
-        if (key in {"deadline", "deadline_conflict"} and self.form.get("pay_by_date")
+        if (key in {"deadline", "deadline_conflict", "date"} and self.form.get("pay_by_date")
                 and not self._eligible_installment_counts()
                 and "installments" in self.questions[self.question_index:]):
             # The count question only exists once installments are chosen, so a
-            # deadline that no plan can meet replaces it immediately.
+            # deadline that no plan can meet replaces it immediately — whether
+            # the deadline came from the sentence or a typed answer.
             index = self.questions.index("installments", self.question_index)
             self.questions[index] = "deadline_conflict"
             self.form["installment_count"] = min(self.installment_counts)
@@ -746,6 +776,55 @@ class TerminalSession:
         amount = round(float(value))
         sign = "-" if amount < 0 else ""
         return f"{sign}{symbol}{abs(amount):,.0f}"
+
+    @staticmethod
+    def _floor_cents(value):
+        """Largest two-decimal amount that does not exceed the value.
+
+        Safety claims ("pay X now") must survive paying X to the cent: a
+        rounded-up amount could leave the balance a fraction below the minimum.
+        """
+        return math.floor(float(value) * 100.0) / 100.0
+
+    def _prose_currency(self, currency, value):
+        """Compact symbol-and-amount text for a conversion note, e.g. $100."""
+        symbol = _PROSE_SYMBOLS.get(currency, currency + " ")
+        value = float(value)
+        text = f"{value:,.0f}" if abs(value - round(value)) < 0.005 else f"{value:,.2f}"
+        return f"{symbol}{text}"
+
+    def _margin_words(self, margin):
+        """Above/below wording for a balance margin; the boundary is at the minimum."""
+        if margin > 0.005:
+            return f"{self._prose(margin)} above your minimum"
+        if margin < -0.005:
+            return f"{self._prose(-margin)} below your minimum"
+        return "exactly at your minimum"
+
+    def _normalize_currency(self):
+        """Convert a foreign-currency request once into the account currency.
+
+        Everything afterwards (acknowledgement, WHY, NUMBERS, OPTIONS) stays in
+        the account currency; the conversion is stated once in the
+        acknowledgement, e.g. "$100 = ₹8,333 (rate 83.33)".
+        """
+        home = str(self.assistant.engine.get_user_home_currency(self.user_id))
+        requested = str(self.form.get("currency") or home)
+        self.form["currency"] = requested
+        amount = self.form.get("amount")
+        if requested == home or not amount:
+            return
+        converted, _home = self.assistant._home_amount(float(amount), requested)
+        if converted is None:
+            return  # no dated rate; the report asks for the home-currency amount
+        original = float(amount)
+        rate = round(float(converted) / original, 2)
+        self.form["amount"] = round(float(converted), 2)
+        self.form["currency"] = home
+        rate_text = f"{rate:.2f}".rstrip("0").rstrip(".")
+        self._conversion_note = (f"{self._prose_currency(requested, original)} = "
+                                 f"{self._prose_currency(home, self.form['amount'])} "
+                                 f"(rate {rate_text})")
 
     def _short(self, day):
         """Short prose date, e.g. 13 Sep."""
@@ -972,33 +1051,37 @@ class TerminalSession:
             if full:
                 low_value, low_day = full["lowest_projected_balance"], full["lowest_projected_date"]
                 below = minimum - low_value
-                if below > 0:
+                if below > 0.005:
                     lines.append(f"Paying {self._prose(self.form['amount'])} in full now would take you to "
                                  f"{self._prose(low_value)} on {self._short(low_day)}, {self._prose(below)} below "
+                                 f"your minimum, so the full payment does not fit in the next 90 days.")
+                elif below > 0:
+                    lines.append(f"Paying {self._prose(self.form['amount'])} in full now would take you to "
+                                 f"{self._prose(low_value)} on {self._short(low_day)}, just under "
                                  f"your minimum, so the full payment does not fit in the next 90 days.")
                 else:
                     lines.append(f"Paying {self._prose(self.form['amount'])} in full now would keep your lowest "
                                  f"balance at {self._prose(low_value)} on {self._short(low_day)}, "
-                                 f"{self._prose(-below)} above your minimum.")
+                                 f"{self._margin_words(-below)}.")
         else:
             low_value, low_day = self._plan_effect_low(result, chosen)
             margin = low_value - minimum
-            above_below = "above" if margin >= 0 else "below"
             amount_text = self._prose(self.form["amount"])
+            margin_text = self._margin_words(margin)
             if chosen["type"] == "pay_in_full_now":
                 lines.append(f"Paying {amount_text} in full now would take you to {self._prose(low_value)} on "
-                             f"{self._short(low_day)}, {self._prose(margin)} {above_below} your minimum, "
+                             f"{self._short(low_day)}, {margin_text}, "
                              f"so you can go ahead today.")
             elif chosen["type"] == "installments":
                 count = self.form.get("installment_count", 3)
                 lines.append(f"Paying {amount_text} in {count} installments would take you to "
-                             f"{self._prose(low_value)} on {self._short(low_day)}, {self._prose(margin)} "
-                             f"{above_below} your minimum, so the plan stays safe.")
+                             f"{self._prose(low_value)} on {self._short(low_day)}, {margin_text}, "
+                             f"so the plan stays safe.")
             elif chosen["type"] == "wait":
                 wait_date = max(chosen["dates"])
                 lines.append(f"Waiting until {self._short(wait_date)} to pay {amount_text} would take you to "
-                             f"{self._prose(low_value)} on {self._short(low_day)}, {self._prose(margin)} "
-                             f"{above_below} your minimum, so waiting makes the payment safe.")
+                             f"{self._prose(low_value)} on {self._short(low_day)}, {margin_text}, "
+                             f"so waiting makes the payment safe.")
             else:
                 entries = sorted(chosen["amounts"].items())
                 first_amount = self._prose(entries[0][1])
@@ -1006,7 +1089,7 @@ class TerminalSession:
                 rest_amount = self._prose(self.form["amount"] - entries[0][1])
                 lines.append(f"Paying {first_amount} now and {rest_amount} on {self._short(rest_date)} would "
                              f"take you to {self._prose(low_value)} on {self._short(low_day)}, "
-                             f"{self._prose(margin)} {above_below} your minimum, so splitting it works.")
+                             f"{margin_text}, so splitting it works.")
         # (e) Pending bank items in plain words.
         pending = situation.get("pending_items_considered_or_ignored") or {}
         ignored = list(pending.get("ignored") or [])
@@ -1159,7 +1242,7 @@ class TerminalSession:
             low = float(situation.get("lowest_projected_balance") or 0) - amount_value
             low_day = self._short(situation.get("lowest_projected_date") or self.as_of_date)
         margin = low - minimum
-        room = f"{self._prose(abs(margin))} {'above' if margin >= 0 else 'below'} your minimum"
+        room = self._margin_words(margin)
         if full_safe:
             lines.append(f"Yes — you can pay the full {amount_text} today.")
         else:
@@ -1178,8 +1261,9 @@ class TerminalSession:
             lines.append(note)
         # 5. The real amount you could pay today and stay above your minimum,
         #    computed from the situation's room, not capped at the request.
+        #    Floored to cents so the quoted amount really is safe to pay.
         try:
-            capacity = max(0.0, float(situation["lowest_projected_balance"]) - minimum)
+            capacity = self._floor_cents(max(0.0, float(situation["lowest_projected_balance"]) - minimum))
         except (KeyError, TypeError, ValueError):
             capacity = 0.0
         if capacity > 0:
@@ -1227,9 +1311,14 @@ class TerminalSession:
         rows = ["OPTION                 WHEN                 TOTAL COST       LOWEST BALANCE   MEETS DEADLINE   SAFE"]
         for option in options:
             safe_mark = "✓" if option.get("safe") else "✗"
+            below = max(0.0, float(minimum) - float(option["lowest_projected_balance"]))
+            # A shortfall that rounds to 0.00 is a hair under the minimum, not
+            # "0.00 below" it; say that instead of printing a contradiction.
+            shortfall = (f"{money(below,currency)} below the minimum" if below > 0.005
+                         else "just under the minimum")
             safety = "SAFE" if option.get("safe") else (
                 f"(drops to {money(option['lowest_projected_balance'],currency)} on "
-                f"{option['lowest_projected_date']}, {money(max(0, minimum-option['lowest_projected_balance']),currency)} below the minimum)"
+                f"{option['lowest_projected_date']}, {shortfall})"
             )
             meets = option.get("meets_deadline")
             meets = "n/a" if meets is None else ("yes" if meets else "no")
@@ -1243,7 +1332,7 @@ class TerminalSession:
                             and x.get("type") in allowed_types]
         other_safe_names = [x["type"].replace("_", " ") for x in other_safe_items]
         earliest = situation.get("earliest_date_for_full_payment")
-        safe_today = float(result["decision"].get("amount_safe_to_pay", 0) or 0)
+        safe_today = self._floor_cents(float(result["decision"].get("amount_safe_to_pay", 0) or 0))
         spending_changes = result["decision"].get("spending_changes_needed", "none")
         shortest_plan = installment_completion_date(self.as_of_date, min(self.installment_counts))
         alts = []
@@ -1261,10 +1350,16 @@ class TerminalSession:
             else:
                 alts.append("Paying in full today is your most direct and cost-effective safe option.")
             buffer = situation["lowest_projected_balance"] - minimum
-            alts.append(
-                f"Projected lowest balance stays {money(buffer, currency)} above your required minimum "
-                f"on {situation['lowest_projected_date']}."
-            )
+            if buffer > 0.005:
+                alts.append(
+                    f"Projected lowest balance stays {money(buffer, currency)} above your required minimum "
+                    f"on {situation['lowest_projected_date']}."
+                )
+            else:
+                alts.append(
+                    f"Projected lowest balance stays exactly at your required minimum "
+                    f"on {situation['lowest_projected_date']}."
+                )
         elif verdict.startswith("NOT RECOMMENDED"):
             full_now = next((x for x in options if x.get("safe") and x["type"] == "pay_in_full_now"), None)
             if full_now and "full_payment" not in self.assistant._profile_allowed_methods():
@@ -1414,7 +1509,7 @@ class TerminalSession:
         min_bal = situation["minimum_balance"]
         low_bal = situation["lowest_projected_balance"]
         low_date = situation["lowest_projected_date"]
-        capacity = max(0.0, low_bal - min_bal)
+        capacity = self._floor_cents(max(0.0, low_bal - min_bal))
         if is_balance and is_afford:
             resp = (
                 f"Your current available balance is {money(curr_bal, currency)}. "
@@ -1495,6 +1590,7 @@ class TerminalSession:
                                   f"pending items: {pending}; as of {self.as_of_date}."))
         elif command == "/reset":
             self.phase = "ready"; self.form = {}; self.questions = []; self.report = None
+            self._conversion_note = None
             self._block("text", "Session reset. What are you considering?")
         elif command == "/user": self._block("text", "Usage: /user <id>")
         elif command.startswith("/user "):
@@ -1505,7 +1601,7 @@ class TerminalSession:
                 first, last = self._event_range()
                 note = self.as_of_note or ""
                 self._block("text", f"User set to {new_user}. Data range: {first} through {last}. {note}")
-        elif command == "/date": self._block("text", "Usage: /user <id>")
+        elif command == "/date": self._block("text", "Usage: /date YYYY-MM-DD")
         elif command.startswith("/date "):
             value = text.split(maxsplit=1)[1]
             first, last = self._event_range()
@@ -1538,7 +1634,7 @@ class TerminalSession:
                          or (current == "fee" and bool(re.fullmatch(r"\d+(?:\.\d+)?", text)))
                          or (current == "partial_amount" and (text == "" or parse_amount(text)[0] is not None)))
             if (self.question_index >= len(self.questions) or self.questions[self.question_index] != "fee") and re.search(r"(?<!\w)-\s*\d", text):
-                self._block("error", "Amounts must be positive; please enter a non-negative amount.")
+                self._block("error", "Amounts must be positive; please enter an amount above zero.")
             elif new_amount is not None and not is_answer:
                 self._block("text", "Starting a new request and resetting the current intake.")
                 self.phase = "ready"
@@ -1592,6 +1688,8 @@ class TerminalSession:
                         self.last_blocks.insert(0, comparison)
                 elif text:
                     self._block("text", "I didn't understand that. Try: 'pay half now', 'wait a month', '6 installments', 'actually 20k', or /help.")
+                else:
+                    self._block("text", "Type a request or a follow-up.")
         else:
             self._start(text)
         return self.last_blocks
@@ -1600,7 +1698,8 @@ class TerminalSession:
         result = result or {}
         current = {
             "verdict": self.report_data(result).get("verdict", "n/a"),
-            "amount safe today": money(result.get("decision", {}).get("amount_safe_to_pay", 0), self.form.get("currency", "INR")),
+            "amount safe today": money(self._floor_cents(result.get("decision", {}).get("amount_safe_to_pay", 0) or 0),
+                                       self.form.get("currency", "INR")),
             "lowest balance": money(result.get("situation", {}).get("lowest_projected_balance", 0), self.form.get("currency", "INR")),
         }
         if previous is None:
@@ -1691,6 +1790,9 @@ class TerminalSession:
         if new_amount is not None and re.search(r"\b(actually|make it)\b", low):
             self.form["amount"] = new_amount
             if currency: self.form["currency"] = currency
+            # An amended amount in another currency is converted once as well.
+            self._conversion_note = None
+            self._normalize_currency()
             return True
         return False
 

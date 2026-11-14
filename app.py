@@ -72,6 +72,9 @@ def report_html(block):
     for title, key in (("ALTERNATIVES", "alternatives"), ("NEXT STEPS", "next_steps")):
         pieces.append(f'<div class="section-title">{title}</div>')
         pieces.extend(f'<p>• {esc(line.lstrip("• "))}</p>' for line in data.get(key, []))
+    if data.get("loan"):
+        pieces.append('<div class="section-title">LOAN OPTION (illustrative)</div>')
+        pieces.append(f'<p>{esc(data["loan"])}</p>')
     return "".join(pieces) + "</div>"
 
 

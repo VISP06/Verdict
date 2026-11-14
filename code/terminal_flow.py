@@ -3,6 +3,7 @@
 import datetime as dt
 import calendar
 import html
+import json
 import math
 import os
 import re
@@ -95,6 +96,43 @@ _CURRENCY_RE = re.compile(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|rs\.?)\b|(?<!
 _FINANCING_RE = re.compile(
     r"\bhow\s+(?:can|could|should|do)\s+(?:i|we)\s+(?:finance|afford|pay)\b"
     r"|\bhow\s+to\s+(?:finance|afford|pay)\b", re.I)
+
+
+def emi(principal, annual_rate_pct, years):
+    """Standard reducing-balance monthly EMI; rates are percentages per year."""
+    principal = float(principal)
+    months = int(round(float(years) * 12))
+    if principal <= 0 or months <= 0:
+        return 0.0
+    monthly_rate = float(annual_rate_pct) / 100.0 / 12.0
+    if monthly_rate == 0:
+        return principal / months
+    factor = (1.0 + monthly_rate) ** months
+    return principal * monthly_rate * factor / (factor - 1.0)
+
+
+def max_principal(payment, annual_rate_pct, years):
+    """Principal supported by a monthly payment at a reducing-balance rate."""
+    payment = float(payment)
+    months = int(round(float(years) * 12))
+    if payment <= 0 or months <= 0:
+        return 0.0
+    monthly_rate = float(annual_rate_pct) / 100.0 / 12.0
+    if monthly_rate == 0:
+        return payment * months
+    factor = (1.0 + monthly_rate) ** months
+    return payment * (factor - 1.0) / (monthly_rate * factor)
+
+
+def _load_loan_reference():
+    path = os.path.join(os.path.dirname(__file__), "loan_reference.json")
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+_VEHICLE_RE = re.compile(
+    r"\b(?:car|bike|scooter|suv|sedan|vehicle|bentley|bmw|audi|mercedes|toyota|"
+    r"honda|maruti|tata|hyundai|kia|mahindra|tesla)\b", re.I)
 
 
 def _followup_count(low):
@@ -551,6 +589,63 @@ class TerminalSession:
         lines.append("Based on: your profile, your bank history, your last 3 months of outflows "
                      "and the engine's 90-day forecast.")
         return {"text": "FINANCING SNAPSHOT\n" + "\n".join(lines), "largest": largest, "fit": fit}
+
+    def _loan_monthly_room(self, situation):
+        """The same counted-income-minus-recurring-outflows room as the snapshot."""
+        income = float(situation.get("monthly_income_total") or 0)
+        return max(0.0, income - self._history_outflow_average())
+
+    def _loan_reference_for_request(self):
+        reference = _load_loan_reference()
+        currency = str(self.form.get("currency") or "").upper()
+        currency_data = reference.get("currencies", {}).get(currency)
+        if not currency_data:
+            return reference, None
+        text = f"{self.form.get('item', '')} {self.request_text}"
+        loan_key = "car_loan" if _VEHICLE_RE.search(text) else "personal_loan"
+        return reference, currency_data[loan_key]
+
+    def _loan_section(self, result):
+        """Illustrative loan comparison appended only to unsafe reports."""
+        reference, loan = self._loan_reference_for_request()
+        currency = str(self.form.get("currency") or "").upper()
+        lines = ["LOAN OPTION (illustrative)"]
+        if loan is None:
+            lines.append(f"No loan reference data for {currency} yet.")
+            return "\n".join(lines)
+
+        situation = result["situation"]
+        principal = float(self.form.get("amount") or 0)
+        room = self._loan_monthly_room(situation)
+        rate = float(loan["illustrative_rate_pct"])
+        tenures = [int(years) for years in loan["tenures_years"]]
+        lines.append(f"Loan type: {loan['label']}.")
+        lines.append(f"Illustrative rate: {rate:g}% a year; this is not an offer.")
+        for years in tenures:
+            monthly = emi(principal, rate, years)
+            total_interest = monthly * years * 12 - principal
+            fits = "fits" if monthly <= room + 1e-9 else "does not fit"
+            lines.append(f"{years} years: {self._money(monthly)} a month; total interest "
+                         f"{self._money(total_interest)}; {fits} your monthly room of {self._money(room)}.")
+
+        longest = max(tenures)
+        longest_payment = emi(principal, rate, longest)
+        fitting = max_principal(room, rate, longest)
+        lines.append(f"Largest loan that fits over {longest} years at {rate:g}%: "
+                     f"{self._money(fitting)}.")
+        low, high = loan["rate_range_pct"]
+        as_of = reference["as_of"]
+        date_text = dt.date.fromisoformat(as_of).strftime("%-d %b %Y")
+        lines.append(f"Typical {loan['label'].replace('-', ' ')} rates in India are about "
+                     f"{low:g}% to {high:g}% a year (checked {date_text}).")
+        if longest_payment > room + 1e-9:
+            lines.append(f"Even over {longest} years the payment would be {self._money(longest_payment)} "
+                         f"against your monthly room of {self._money(room)}, so a loan this size isn't "
+                         f"realistic. A loan of up to {self._money(fitting)} would fit.")
+        lines.append("This is an illustration, not a quote or financial advice. Lenders also check your "
+                     "credit score and income. Compare offers before applying.")
+        lines.append("Based on: reference data checked " + date_text + ": " + "; ".join(loan["sources"]))
+        return "\n".join(lines)
 
     def _has_installment_conflict(self, deadline):
         count = self.form.get("installment_count") if (self.form.get("allow_installments") and getattr(self, "_installment_count_given", False)) else None
@@ -1997,7 +2092,9 @@ class TerminalSession:
         end_date = dates[-1] if dates else (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
         start_balance = vals[0] if vals else situation["current_balance"]
         end_balance = vals[-1] if vals else situation["current_balance"]
-        return (f"╭─ {verdict} ─╮\nWHY\n{why}\n\nNUMBERS\n90-day balance: {spark}\nMinimum-balance level: {self._money(minimum,currency)}\n{start_date} {self._money(start_balance,currency)} → {end_date} {self._money(end_balance,currency)}\n\nOPTIONS\n" + "\n".join(rows) + "\n\nALTERNATIVES\n" + "\n".join("• "+s for s in alts) + "\n\nNEXT STEPS\n" + "\n".join("• "+s for s in steps) + "\n╰" + "─" * max(10, len(verdict) + 4) + "╯")
+        loan = self._loan_section(result) if verdict.startswith("NOT RECOMMENDED") else None
+        loan_text = f"\n\n{loan}" if loan else ""
+        return (f"╭─ {verdict} ─╮\nWHY\n{why}\n\nNUMBERS\n90-day balance: {spark}\nMinimum-balance level: {self._money(minimum,currency)}\n{start_date} {self._money(start_balance,currency)} → {end_date} {self._money(end_balance,currency)}\n\nOPTIONS\n" + "\n".join(rows) + "\n\nALTERNATIVES\n" + "\n".join("• "+s for s in alts) + "\n\nNEXT STEPS\n" + "\n".join("• "+s for s in steps) + loan_text + "\n╰" + "─" * max(10, len(verdict) + 4) + "╯")
 
     def report_data(self, result):
         rendered = self.render_report(result)
@@ -2026,9 +2123,12 @@ class TerminalSession:
                             "meets_deadline": "n/a" if item.get("meets_deadline") is None else ("yes" if item.get("meets_deadline") else "no"),
                             "safe": bool(item.get("safe")),
                             "note": "" if item.get("safe") else f"Unsafe: drops to {self._money(low, self.form['currency'])} on {item.get('lowest_projected_date')}"})
-        sections = rendered.split("\n\nALTERNATIVES\n")
+        loan_parts = rendered.split("\n\nLOAN OPTION (illustrative)\n", 1)
+        rendered_without_loan = loan_parts[0]
+        loan_text = loan_parts[1].split("\n╰", 1)[0] if len(loan_parts) > 1 else ""
+        sections = rendered_without_loan.split("\n\nALTERNATIVES\n")
         alternatives = sections[-1].split("\n\nNEXT STEPS\n")[0].splitlines() if len(sections) > 1 else []
-        next_steps = rendered.split("\n\nNEXT STEPS\n", 1)[-1].split("\n╰", 1)[0].splitlines()
+        next_steps = rendered_without_loan.split("\n\nNEXT STEPS\n", 1)[-1].split("\n╰", 1)[0].splitlines()
         return {"verdict": verdict, "status": status,
                 "why": rendered.split("WHY\n", 1)[-1].split("\n\nNUMBERS", 1)[0],
                 "numbers": {"sparkline_values": values, "minimum": situation["minimum_balance"],
@@ -2036,7 +2136,8 @@ class TerminalSession:
                             "end_date": dates[-1] if dates else self.as_of_date,
                             "start_balance": values[0] if values else situation["current_balance"],
                             "end_balance": values[-1] if values else situation["current_balance"]},
-                "options": options, "alternatives": alternatives, "next_steps": next_steps}
+                "options": options, "alternatives": alternatives, "next_steps": next_steps,
+                "loan": loan_text}
 
     def _handle_account_inquiry(self, text):
         low = text.lower()

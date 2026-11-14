@@ -19,7 +19,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "code"))
 from assistant import Assistant
-from terminal_flow import TerminalSession
+from terminal_flow import TerminalSession, emi, max_principal
 
 
 FAKE_USERS = (
@@ -154,6 +154,55 @@ def test_financing_snapshot_continues_for_a_feasible_amount(split_dataset):
     assert session.phase == "intake"
     assert session.questions
     assert any(block["kind"] == "prompt" for block in blocks)
+
+
+def test_loan_math_known_value_and_inverse():
+    monthly = emi(18_000_000, 9.0, 7)
+    assert monthly == pytest.approx(289_603.41, abs=0.01)
+    assert max_principal(monthly, 9.0, 7) == pytest.approx(18_000_000, abs=0.01)
+
+
+def test_loan_reference_uses_vehicle_and_personal_loan_config(split_dataset):
+    _assistant, vehicle = _session(split_dataset, "fx_all3")
+    vehicle.handle("I want to buy a Bentley Continental GT worth 1.8 Crore. How can I finance this?")
+    vehicle_report = vehicle.last_blocks[-1]["text"]
+    assert "LOAN OPTION (illustrative)" in vehicle_report
+    assert "Loan type: car loan." in vehicle_report
+    assert "7 years:" in vehicle_report and "5 years:" in vehicle_report
+    assert "7.4% to 11.5%" in vehicle_report
+    assert "This is an illustration, not a quote or financial advice." in vehicle_report
+
+    _assistant2, personal = _session(split_dataset, "fx_all3")
+    personal.handle("How can I finance a 20 lakh laptop?")
+    personal_report = personal.last_blocks[-1]["text"]
+    assert "Loan type: personal loan." in personal_report
+
+
+def test_loan_fit_and_non_fit_are_reported_from_monthly_room(split_dataset):
+    _assistant, session = _session(split_dataset, "fx_all3")
+    session.handle("I want to buy a car worth 1.8 Crore. How can I finance this?")
+    report = session.last_blocks[-1]["text"]
+    assert "does not fit your monthly room" in report
+    assert "Largest loan that fits over 7 years" in report
+    assert "isn't realistic" in report
+
+    _assistant2, smaller = _session(split_dataset, "fx_all3")
+    smaller.form = {"amount": 60_000, "currency": "INR", "item": "laptop"}
+    result = smaller.assistant.advise({"amount": 60_000, "currency": "INR", "item": "laptop",
+                                       "pay_by_date": None, "allow_partial": False,
+                                       "allow_installments": False})
+    loan = smaller._loan_section(result)
+    assert "Loan type: personal loan." in loan
+    assert "5 years:" in loan and "3 years:" in loan
+
+
+def test_non_inr_has_explicit_no_reference_line(split_dataset):
+    _assistant, session = _session(split_dataset, "fx_all3")
+    session.form = {"amount": 60_000, "currency": "USD", "item": "laptop"}
+    result = session.assistant.advise({"amount": 60_000, "currency": "INR", "item": "laptop",
+                                       "pay_by_date": None, "allow_partial": False,
+                                       "allow_installments": False})
+    assert session._loan_section(result) == "LOAN OPTION (illustrative)\nNo loan reference data for USD yet."
 
 
 def test_enter_accepts_the_zero_fee_default(split_dataset):

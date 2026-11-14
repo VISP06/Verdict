@@ -2,7 +2,7 @@
 
 Bug 1: "Change number of installments to be 3" & co. amend the request that is
 already on the table (same amount, same item, same deadline) instead of being
-parsed as a new INR 3.00 request, and a bare number after to/be/into with no
+parsed as a new ₹3.00 request, and a bare number after to/be/into with no
 currency and no purchase cue is never taken as a new amount.
 
 Bug 2: when no allowed installment plan completes by the kept deadline and no
@@ -130,11 +130,11 @@ def test_followup_phrasings_keep_amount_item_and_never_reask_deadline(fake_datas
     assert session.form["pay_by_date"] is None  # the previous deadline is kept
     assert any(block["kind"] == "report" for block in blocks)
     assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
-    assert "INR 50,000.00" in blocks[-1]["text"]
-    # No intake question is repeated and no phantom INR 3.00 request appears.
+    assert "₹50,000.00" in blocks[-1]["text"]
+    # No intake question is repeated and no phantom ₹3.00 request appears.
     assert not any("When do you need to pay?" in block["text"] for block in blocks)
     assert not any(block["text"].startswith("Got it:") for block in blocks)
-    assert not any("INR 3.00" in block["text"] for block in blocks)
+    assert not any("₹3.00" in block["text"] for block in blocks)
 
 
 def test_reported_request_with_cue_and_currency_is_still_new(fake_dataset):
@@ -302,7 +302,7 @@ def test_item_extraction_drops_relative_pronoun(fake_dataset):
     assert TerminalSession._request_item("Can I afford a laptop that costs 80000? ") == "laptop"
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Can I afford a laptop that costs 80000?")
-    assert "Got it: INR 80,000.00 · laptop · installments · no deadline given yet." == blocks[0]["text"]
+    assert "Got it: ₹80,000.00 · laptop · installments · no deadline given yet." == blocks[0]["text"]
 
 
 def test_profile_gates_questions_chips_and_neutral_followups(fake_dataset):
@@ -392,10 +392,10 @@ def test_partial_amount_question_defaults_to_safest_and_clamps(fake_dataset):
     session.handle("")  # no deadline
     blocks = session.handle("3")  # pay part now
     prompt = blocks[-1]["text"]
-    assert "INR 103,080.99 now (safest, default)" in prompt
-    assert "INR 75,000.00 now (half)" in prompt
+    assert "₹1,03,080.99 now (safest, default)" in prompt
+    assert "₹75,000.00 now (half)" in prompt
     blocks = session.handle("120000")  # typed amount above the safe capacity
-    assert any("Only INR 103,080.99 is safe to pay today; using it." in block["text"]
+    assert any("Only ₹1,03,080.99 is safe to pay today; using it." in block["text"]
                for block in blocks)
     assert abs(session.form["partial_amount"] - 103080.99) < 0.01
     assert any(block["kind"] == "report" for block in blocks)
@@ -407,7 +407,7 @@ def test_partial_amount_rejects_above_amount_then_defaults(fake_dataset):
     session.handle("")  # no deadline
     session.handle("3")  # pay part now
     blocks = session.handle("200000")  # above the requested amount
-    assert "Enter an amount up to INR 150,000.00" in blocks[0]["text"]
+    assert "Enter an amount up to ₹1,50,000.00" in blocks[0]["text"]
     blocks = session.handle("200000")  # second miss falls back to the safest amount
     assert any(block["kind"] == "report" for block in blocks)
     assert abs(session.form["partial_amount"] - 103080.99) < 0.01
@@ -417,9 +417,9 @@ def test_not_recommended_why_has_no_unqualified_safe_claim(fake_dataset):
     _assistant, session = _session(fake_dataset)
     session.handle("Laptop 500k no deadline just advise")
     text = session.handle("why not now")[0]["text"]
-    assert "No — you cannot pay the full ₹500,000 today." in text
+    assert "No — you cannot pay the full ₹5,00,000 today." in text
     assert "would be safe" not in text
-    assert "You could pay up to ₹103,081 today and stay above your minimum." in text
+    assert "You could pay up to ₹1,03,081 today and stay above your minimum." in text
 
 
 def test_safe_but_profile_excluded_payment_is_disclosed(fake_dataset):
@@ -518,7 +518,7 @@ def test_why_and_why_not_now_are_clean_prose(fake_dataset):
     assert any(line.startswith("Coming up:") for line in nn_lines)
     assert any(line.startswith("Income:") for line in nn_lines)
     # The safe line quotes the real room above the minimum, not the request-capped amount.
-    assert "You could pay up to ₹103,081 today and stay above your minimum." in not_now
+    assert "You could pay up to ₹1,03,081 today and stay above your minimum." in not_now
     assert "[" not in not_now
     assert nn_lines[-1] == "Based on: your profile, your bank history and your salary pattern."
 

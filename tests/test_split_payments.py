@@ -110,6 +110,52 @@ def test_split_fee_accepts_chips_and_typed_values_up_to_five(split_dataset):
     assert session2.form["split_fee_pct"] == 3.0
 
 
+def test_inr_grouping_and_lakh_acknowledgement(split_dataset):
+    _assistant, session = _session(split_dataset)
+    blocks = session.handle("Laptop 1.8 lakh no deadline just advise")
+    assert blocks[0]["text"].startswith("Got it: ₹1.8 lakh")
+    report = blocks[-1]["text"]
+    assert "₹1,80,000.00" in report
+    assert "₹1,80,000" in report
+
+
+def test_not_recommended_why_explains_the_chosen_installment_plan(split_dataset):
+    _assistant, session = _session(split_dataset, "fx_inst12")
+    session.handle("Laptop 20 lakh in 12 installments no deadline just advise")
+    why = session.render_report(session.report).split("WHY\n", 1)[1].split("\n\nNUMBERS", 1)[0]
+    assert "12 payments of" in why
+    assert "monthly salary" in why
+    assert "first falls below your minimum" in why
+    assert "paying" not in why.lower() or "in full" not in why.lower()
+
+
+def test_financing_snapshot_skips_an_impossible_amount(split_dataset):
+    _assistant, session = _session(split_dataset, "fx_all3")
+    blocks = session.handle("I want to buy a car worth 1.8 Crore. How can I finance this?")
+    text = "\n".join(block["text"] for block in blocks)
+    assert text.startswith("FINANCING SNAPSHOT")
+    assert "Safe to pay today:" in text
+    assert "Pay in full:" in text
+    assert "Part now, rest later:" in text
+    assert "Installments:" in text
+    assert "What would fit:" in text
+    assert "Based on:" in text
+    assert "NOT RECOMMENDED" in text
+    assert "Ask about a smaller amount" in text
+    assert session.questions == []
+
+
+def test_financing_snapshot_continues_for_a_feasible_amount(split_dataset):
+    _assistant, session = _session(split_dataset, "fx_all3")
+    blocks = session.handle("How can I finance a 60,000 laptop?")
+    assert blocks[0]["text"].startswith("FINANCING SNAPSHOT")
+    assert "Safe to pay today:" in blocks[0]["text"]
+    assert "Based on:" in blocks[0]["text"]
+    assert session.phase == "intake"
+    assert session.questions
+    assert any(block["kind"] == "prompt" for block in blocks)
+
+
 def test_enter_accepts_the_zero_fee_default(split_dataset):
     _assistant, session = _session(split_dataset)
     session.handle("Laptop 12k in 14 days")
@@ -147,8 +193,8 @@ def test_split_verdict_shows_per_payment_dates_and_total_with_fee(split_dataset)
     session.handle("2")               # 2% fee
     report = blocks_text = session.last_blocks[-1]["text"]
     assert report.split("\n", 1)[0] == "╭─ SPLIT INTO 2 EQUAL PAYMENTS ─╮"
-    assert "split 2 × INR 6,120.00" in report          # 12,000 x 1.02 / 2
-    assert "Total with the 2% fee is INR 12,240.00" in report
+    assert "split 2 × ₹6,120.00" in report          # 12,000 x 1.02 / 2
+    assert "Total with the 2% fee is ₹12,240.00" in report
     assert "2024-09-05, 2024-09-19" in report
 
 
@@ -236,7 +282,7 @@ def test_fee_change_recomputes_amounts_and_an_invalid_fee_is_refused(split_datas
     blocks = session.handle("fee 3%")
     assert session.form["split_fee_pct"] == 3.0
     assert any(block["kind"] == "report" for block in blocks)
-    assert "Total with the 3% fee is INR 12,360.00" in blocks[-1]["text"]
+    assert "Total with the 3% fee is ₹12,360.00" in blocks[-1]["text"]
     blocks = session.handle("fee 9%")
     assert blocks[0]["text"] == "No change: the split fee must be between 0 and 5 percent."
     assert session.form["split_fee_pct"] == 3.0   # the previous plan is kept

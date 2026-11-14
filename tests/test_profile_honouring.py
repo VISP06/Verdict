@@ -171,4 +171,4 @@ def test_report_shows_monthly_counted_income_not_window_total(fake_dataset):
     assert advise_monthly == situation_monthly
     session.form = form
     rendered = session.render_report(result)
-    assert "your salary of ₹149,000 lands on the 15th" in rendered
+    assert "your salary of ₹1,49,000 lands on the 15th" in rendered

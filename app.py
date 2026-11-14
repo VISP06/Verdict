@@ -11,8 +11,7 @@ import streamlit as st
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "code"))
 from assistant import Assistant
-from money import money
-from terminal_flow import BANNER, TerminalSession
+from terminal_flow import BANNER, TerminalSession, fmt_money
 
 APP_VERSION = "glacier-terminal-v4"
 DATASET = os.path.join(ROOT, "dataset")
@@ -52,14 +51,14 @@ def report_html(block):
     levels = "▁▂▃▄▅▆▇█"
     lo, hi = (min(vals), max(vals)) if vals else (0, 0)
     spark = "".join(levels[round((v-lo)/(hi-lo)*7)] if hi != lo else "▄" for v in vals)
-    range_text = (f"{numbers.get('start_date', '')} · {money(numbers.get('start_balance', 0), currency)}"
-                  f" → {numbers.get('end_date', '')} · {money(numbers.get('end_balance', 0), currency)}")
+    range_text = (f"{numbers.get('start_date', '')} · {fmt_money(numbers.get('start_balance', 0), currency)}"
+                  f" → {numbers.get('end_date', '')} · {fmt_money(numbers.get('end_balance', 0), currency)}")
     pieces = [f'<div class="report status-{esc(status)}" style="--status:{color}">',
               f'<div class="verdict">{esc(data.get("verdict", "Report"))}</div>']
     for title, key in (("WHY", "why"),):
         pieces += [f'<div class="section-title">{title}</div><p>{esc(data.get(key, ""))}</p>']
     pieces += [f'<div class="section-title">NUMBERS</div><div class="spark">{esc(spark)}</div>',
-               f'<p>Minimum balance: {esc(money(numbers.get("minimum", 0), currency))}</p>',
+               f'<p>Minimum balance: {esc(fmt_money(numbers.get("minimum", 0), currency))}</p>',
                f'<div class="range">{esc(range_text)}</div>', '<div class="section-title">OPTIONS</div>',
                '<table class="options-table"><thead><tr><th>OPTION</th><th>WHEN</th><th>COST</th><th>LOWEST</th><th>DEADLINE</th><th>SAFE</th></tr></thead><tbody>']
     for option in data.get("options", []):
@@ -104,8 +103,8 @@ if (not isinstance(session, TerminalSession) or not hasattr(getattr(session, "as
 try:
     situation = session.assistant.situation()
     currency = str(session.assistant.engine.get_user_home_currency(user_id))
-    chips = [("user", user_id), ("currency", currency), ("balance", money(situation["current_balance"], currency)),
-             ("minimum", money(situation["minimum_balance"], currency)), ("as-of", session.as_of_date)]
+    chips = [("user", user_id), ("currency", currency), ("balance", fmt_money(situation["current_balance"], currency)),
+             ("minimum", fmt_money(situation["minimum_balance"], currency)), ("as-of", session.as_of_date)]
 except Exception:
     currency = "INR"
     chips = [("user", user_id), ("currency", currency), ("as-of", session.as_of_date)]

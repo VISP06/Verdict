@@ -92,6 +92,9 @@ _FOLLOWUP_COUNT_PATTERNS = (
 )
 _PURCHASE_CUE_RE = re.compile(r"\b(?:pay|paying|afford|cost|costs|buy|buying|purchase)\b")
 _CURRENCY_RE = re.compile(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|rs\.?)\b|(?<!\w)R(?=\s*\d))", re.I)
+_FINANCING_RE = re.compile(
+    r"\bhow\s+(?:can|could|should|do)\s+(?:i|we)\s+(?:finance|afford|pay)\b"
+    r"|\bhow\s+to\s+(?:finance|afford|pay)\b", re.I)
 
 
 def _followup_count(low):
@@ -130,6 +133,47 @@ def _amount_candidates(text):
     return result
 
 
+def _indian_digits(value, decimals=2):
+    """Indian digit grouping for INR amounts: 1,80,00,000 (last 3 digits, then pairs)."""
+    value = float(value)
+    sign = "-" if value < 0 else ""
+    text = f"{abs(value):,.{decimals}f}"
+    whole, _dot, frac = text.partition(".")
+    whole = whole.replace(",", "")
+    if len(whole) <= 3:
+        grouped = whole
+    else:
+        suffix = whole[-3:]
+        prefix = whole[:-3]
+        groups = []
+        while prefix:
+            groups.insert(0, prefix[-2:])
+            prefix = prefix[:-2]
+        grouped = ",".join(groups + [suffix])
+    return f"{sign}{grouped}{('.' + frac) if frac else ''}"
+
+
+def fmt_money(value, currency):
+    """money() with Indian digit grouping and the ₹ symbol for INR accounts."""
+    if str(currency).upper() != "INR":
+        return money(value, currency)
+    value = float(value)
+    return f"{'-' if value < 0 else ''}₹{_indian_digits(abs(value))}"
+
+
+def inr_ack_words(value):
+    """Compact Indian words for the acknowledgement: ₹1.8 crore, ₹12 lakh.
+
+    Returns None below 1 lakh, where the full grouped amount is clearer.
+    """
+    value = float(value)
+    if value >= 10_000_000:
+        return f"₹{round(value / 10_000_000, 2):g} crore"
+    if value >= 100_000:
+        return f"₹{round(value / 100_000, 2):g} lakh"
+    return None
+
+
 class TerminalSession:
     def __init__(self, user_id="user_07", as_of_date=None, dataset_dir=None, assistant=None):
         self.dataset_dir = dataset_dir or os.path.join(os.path.dirname(__file__), "..", "dataset")
@@ -161,6 +205,7 @@ class TerminalSession:
         self._split_classes_cache = None
         self._fee_invalid = False
         self._conversion_note = None
+        self._snapshot = None
 
     @property
     def as_of_note(self):
@@ -270,7 +315,7 @@ class TerminalSession:
                 "meets_deadline": (max(schedule) <= self.form["pay_by_date"]
                                    if self.form.get("pay_by_date") else None),
                 "safe": low >= minimum - 1e-9, "minimum_balance": minimum,
-                "label": f"split {count} × {money(amounts[0], self.form.get('currency', 'INR'))}"}
+                "label": f"split {count} × {fmt_money(amounts[0], self.form.get('currency', 'INR'))}"}
 
     def _evaluate_split(self):
         """Evaluate evenly spaced equal-payment schedules through the engine.
@@ -338,6 +383,174 @@ class TerminalSession:
         row["affordability_status"] = "affordable_with_plan"
         row["recommended_payment_method"] = "partial_payment"
         row["payment_plan"] = format_payment_plan(suggested["dates"])
+
+    def _history_outflow_average(self):
+        """Average monthly debit outflows over the last 3 months of bank history."""
+        events = self.assistant.engine.events
+        user = events[events.user_id.astype(str).eq(self.user_id)]
+        try:
+            recurring = self.assistant.engine.forecast.recurring_series(
+                user, dt.date.fromisoformat(self.as_of_date), min_months=3,
+                amount_mode="mean")
+            recurring_total = sum(float(item.get("amount", 0)) for item in recurring
+                                  if str(item.get("key", ("", ""))[1]).lower() in {"debit", "out"})
+            if recurring:
+                return recurring_total
+        except Exception:
+            # Keep the snapshot deterministic for lightweight fake engines too.
+            pass
+        end = dt.date.fromisoformat(self.as_of_date)
+        start = end - dt.timedelta(days=91)
+        total = 0.0
+        for row in user.itertuples():
+            day = str(getattr(row, "event_date", ""))[:10]
+            if (start.isoformat() <= day < end.isoformat()
+                    and str(getattr(row, "direction", "")).lower() == "debit"
+                    and str(getattr(row, "status", "")).lower() == "settled"):
+                try:
+                    amount = float(getattr(row, "amount"))
+                except (TypeError, ValueError):
+                    continue
+                if not math.isnan(amount):
+                    total += amount
+        return total / 3.0
+
+    def _largest_full_payment(self, situation):
+        """Engine-bisected maximum for the full-payment method."""
+        payment = self._floor_cents(self._bisect_safe_payment(
+            lambda amount: {self.as_of_date: amount},
+            self._unsafe_payment_bound(situation)))
+        return payment
+
+    def _bisect_safe_payment(self, schedule_of_payment, hi):
+        """Largest payment p whose dated schedule keeps every projected balance safe."""
+        lo = 0.0
+        classes = self._split_income_classes()
+        for _ in range(40):
+            if hi - lo <= 0.01:
+                break
+            mid = (lo + hi) / 2.0
+            balances, minimum = self.assistant.engine.simulate_90_days(
+                self.user_id, self.as_of_date, additional_payments=schedule_of_payment(mid),
+                income_classes=classes, **FORECAST_CONFIG)
+            if min(balances.values()) >= minimum - 1e-9:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def _unsafe_payment_bound(self, situation):
+        """A payment that certainly breaks the minimum, used as the bisect upper bound."""
+        return float(situation["current_balance"]) + float(situation["minimum_balance"]) + 1000.0
+
+    def _largest_part_now_plan(self, situation):
+        """Largest purchase that stays safe paying half now and half at the strongest later day."""
+        balances = situation.get("balances") or {}
+        best_day = max((day for day in balances if day > self.as_of_date),
+                       key=lambda day: balances[day], default=None)
+        if not best_day:
+            return None
+        payment = self._floor_cents(self._bisect_safe_payment(
+            lambda per: {self.as_of_date: per, best_day: per},
+            self._unsafe_payment_bound(situation)))
+        if payment <= 0:
+            return None
+        return 2 * payment, best_day
+
+    def _largest_installment_plan(self, situation):
+        """Largest purchase fitting the profile-capped installment count.
+
+        Every payment inside the 90-day window must keep the balance safe in the
+        forecast, and the monthly payment must stay within the estimated monthly
+        room (counted income minus the 3-month outflow average).
+        """
+        cap = self.assistant._max_installment_months() or 12
+        cap = min(12, int(cap))
+        as_of = dt.date.fromisoformat(self.as_of_date)
+        dates = [(as_of + dt.timedelta(days=30 * i)).isoformat()
+                 for i in range(min(cap, 90 // 30 + 1))]
+        per = self._floor_cents(self._bisect_safe_payment(
+            lambda payment: {day: payment for day in dates},
+            self._unsafe_payment_bound(situation)))
+        room = float(situation.get("monthly_income_total") or 0) - self._history_outflow_average()
+        total = max(0.0, min(per * cap, self._floor_cents(max(0.0, room) * cap)))
+        return total, round(total / cap, 2), cap
+
+    def _build_financing_snapshot(self):
+        """FINANCING SNAPSHOT for 'how can I finance/afford/pay' questions.
+
+        Every figure comes from the engine (forecast and capacity) or the user's
+        own history; nothing is invented.
+        """
+        with fp.session(self.session_id):
+            with fp.tool_call("financing_snapshot", input={"user_id": self.user_id}) as tool:
+                snapshot = self._financing_snapshot_lines()
+                skip = float(self.form["amount"]) > snapshot["largest"]
+                tool.output = {"largest_feasible": snapshot["largest"],
+                               "skip_questionnaire": skip}
+        return snapshot, skip
+
+    def _financing_snapshot_lines(self):
+        home = self.form.get("currency", "INR")
+        situation = self.assistant.situation()
+        minimum = float(situation["minimum_balance"])
+        capacity = self._floor_cents(max(0.0, float(situation["lowest_projected_balance"]) - minimum))
+        amount = float(self.form["amount"])
+        amount_text = self._prose(amount)
+        item = str(self.form.get("item") or "")
+        subject = f"The {item}" if item and item != "payment" and "?" not in item else "The request"
+        allowed = self.assistant._profile_allowed_methods()
+        lines = []
+        if capacity > 0:
+            ratio = amount / capacity
+            if ratio >= 1.95:
+                times = f"about {round(ratio)} times larger"
+            elif ratio >= 1.05:
+                times = f"about {ratio:.1f} times larger"
+            else:
+                times = f"about {round(ratio * 100)}% of what is safe today"
+            lines.append(f"Safe to pay today: {self._money(capacity, home)}. {subject} costs "
+                         f"{amount_text} — {times}.")
+        else:
+            lines.append(f"Safe to pay today: {self._money(0.0, home)}. {subject} costs {amount_text}, "
+                         f"and no payment today keeps your balance above the minimum.")
+        largest = 0.0
+        fit = "nothing with your current balance and history"
+        if "full_payment" in allowed:
+            full_limit = self._largest_full_payment(situation)
+            lines.append(f"Pay in full: up to {self._money(full_limit, home)} today, in one payment.")
+            if full_limit > largest:
+                largest, fit = full_limit, f"up to {self._money(full_limit, home)} paid in full today"
+        if "partial_payment" in allowed:
+            part = self._largest_part_now_plan(situation)
+            if part:
+                part_amount, part_day = part
+                lines.append(f"Part now, rest later: up to {self._money(part_amount, home)} if you pay "
+                             f"half now and half on {self._short(part_day)}.")
+                if part_amount > largest:
+                    largest, fit = part_amount, (f"up to {self._money(part_amount, home)} paying half now "
+                                                 f"and half on {self._short(part_day)}")
+        if "installments" in allowed:
+            plan = self._largest_installment_plan(situation)
+            if plan:
+                inst_amount, per, count = plan
+                lines.append(f"Installments: a purchase of up to {self._money(inst_amount, home)} over "
+                             f"{count} months — about {self._money(per, home)} a month.")
+                income = float(situation.get("monthly_income_total") or 0)
+                outflow = self._history_outflow_average()
+                room = income - outflow
+                lines.append(f"That monthly payment stays within the estimated monthly room of "
+                             f"{self._prose(max(0.0, room))} — counted income {self._prose(income)} minus "
+                             f"average outflows {self._prose(outflow)} over your last 3 months of history. "
+                             f"Payments in the next 90 days keep your balance above the minimum; "
+                             f"beyond 90 days it is an estimate.")
+                if inst_amount > largest:
+                    largest, fit = inst_amount, (f"a purchase of up to {self._money(inst_amount, home)} "
+                                                 f"over {count} months")
+        lines.append(f"What would fit: {fit}.")
+        lines.append("Based on: your profile, your bank history, your last 3 months of outflows "
+                     "and the engine's 90-day forecast.")
+        return {"text": "FINANCING SNAPSHOT\n" + "\n".join(lines), "largest": largest, "fit": fit}
 
     def _has_installment_conflict(self, deadline):
         count = self.form.get("installment_count") if (self.form.get("allow_installments") and getattr(self, "_installment_count_given", False)) else None
@@ -491,7 +704,7 @@ class TerminalSession:
             self.phase = "amount_clarification"
             self._ambiguous_line = line
             self._amount_choices = candidates
-            options = " or ".join(money(item, currency or self.assistant.engine.get_user_home_currency(self.user_id)) for item in candidates)
+            options = " or ".join(fmt_money(item, currency or self.assistant.engine.get_user_home_currency(self.user_id)) for item in candidates)
             prompt = f"Which amount did you mean: {options}?"
             return [self._block("prompt", prompt, {"question": prompt, "options": []})]
         if hasattr(self, "_forced_amount"):
@@ -514,6 +727,19 @@ class TerminalSession:
         # currency; every figure afterwards is shown in the account currency.
         self._normalize_currency()
         lowered = line.lower()
+        self._snapshot = None
+        if _FINANCING_RE.search(lowered):
+            # Financing questions open with an engine-backed snapshot, before
+            # any intake question; an impossible amount skips the questionnaire.
+            snapshot, skip = self._build_financing_snapshot()
+            self._snapshot = snapshot
+            self._block("text", snapshot["text"])
+            if skip:
+                self._snapshot["skip"] = True
+                self.questions = []
+                self.phase = "intake"
+                self.question_index = 0
+                return self._make_report()
         self.questions = []
         self._installment_count_given = False
         if not self._parse_deadline(line):
@@ -623,7 +849,7 @@ class TerminalSession:
             item = match.group(1)
         else:
             item = re.sub(r"\b(?:can i|can we|should i|should we)\b", "", value, flags=re.I)
-            item = re.sub(r"\b(?:buy|purchase|afford)\b", "", item, flags=re.I)
+            item = re.sub(r"\b(?:buy|purchase|afford|finance|financing|pay for|how|do)\b", "", item, flags=re.I)
             item = re.split(r"\b(?:worth|costing|costs?|by|i will|i'll|without|no installments?|that)\b", item, maxsplit=1, flags=re.I)[0]
             item = re.sub(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|Rs\.?)\b)\s*", "", item, flags=re.I)
             item = re.sub(r"\b\d[\d,.]*(?:\s*(?:k|thousand|lakh|lakhs|lac|lacs|crore|crores))?\b", "", item, flags=re.I)
@@ -671,7 +897,11 @@ class TerminalSession:
 
     def _acknowledge(self, lowered):
         """One short acknowledgement per new request, built only from parsed fields."""
-        parts = [f"Got it: {money(self.form['amount'], self.form['currency'])}"]
+        if str(self.form["currency"]).upper() == "INR":
+            ack_amount = inr_ack_words(self.form["amount"]) or self._money(self.form["amount"])
+        else:
+            ack_amount = self._money(self.form["amount"], self.form["currency"])
+        parts = [f"Got it: {ack_amount}"]
         item = str(self.form.get("item") or "")
         if item and item != "payment" and "installments" not in item:
             parts.append(html.escape(item, quote=True))
@@ -924,14 +1154,20 @@ class TerminalSession:
                     and chosen.get("meets_deadline") is False)
 
     def _fmt(self, value):
-        return money(value, self.form["currency"])
+        return fmt_money(value, self.form["currency"])
+
+    def _money(self, value, currency=None):
+        """Table-and-data money text, Indian grouping for INR accounts."""
+        return fmt_money(value, currency if currency is not None else self.form.get("currency", "INR"))
 
     def _prose(self, value):
-        """Whole-number currency for prose text, e.g. ₹184,081."""
+        """Whole-number currency for prose text, e.g. ₹1,80,081."""
         symbol = _PROSE_SYMBOLS.get(self.form["currency"], self.form["currency"] + " ")
         amount = round(float(value))
         sign = "-" if amount < 0 else ""
-        return f"{sign}{symbol}{abs(amount):,.0f}"
+        grouped = (_indian_digits(abs(amount), decimals=0) if self.form["currency"] == "INR"
+                   else f"{abs(amount):,.0f}")
+        return f"{sign}{symbol}{grouped}"
 
     @staticmethod
     def _floor_cents(value):
@@ -946,8 +1182,12 @@ class TerminalSession:
         """Compact symbol-and-amount text for a conversion note, e.g. $100."""
         symbol = _PROSE_SYMBOLS.get(currency, currency + " ")
         value = float(value)
-        text = f"{value:,.0f}" if abs(value - round(value)) < 0.005 else f"{value:,.2f}"
-        return f"{symbol}{text}"
+        if str(currency).upper() == "INR":
+            grouped = _indian_digits(abs(value), decimals=2 if abs(value - round(value)) >= 0.005 else 0)
+        else:
+            grouped = f"{abs(value):,.0f}" if abs(value - round(value)) < 0.005 else f"{abs(value):,.2f}"
+        sign = "-" if value < 0 else ""
+        return f"{sign}{symbol}{grouped}"
 
     def _margin_words(self, margin):
         """Above/below wording for a balance margin; the boundary is at the minimum."""
@@ -1168,6 +1408,89 @@ class TerminalSession:
         low_day, low_value = min(later, key=lambda item: item[1])
         return low_value, low_day
 
+    def _user_plan_row(self, result):
+        """The ranked row for the payment method the user chose, safe or not.
+
+        The default WHY path already describes a safe chosen plan; this helper
+        exists so that a NOT RECOMMENDED verdict can still explain itself with
+        the plan the user asked about (installments, split, part-now), instead
+        of describing only "pay in full".
+        """
+        chosen = result.get("recommended_option")
+        if chosen is not None and chosen.get("safe", False):
+            return None
+        options = result.get("ranked_options", [])
+        if self.form.get("allow_split"):
+            rows = [x for x in options if x.get("type") == "split"]
+            if rows:
+                wanted = self.form.get("split_count")
+                match = next((x for x in rows if wanted and x.get("count") == int(wanted)), None)
+                return match or max(rows, key=lambda x: x.get("count", 0))
+        count = self.form.get("installment_count")
+        if self.form.get("allow_installments") and count:
+            match = next((x for x in options if x.get("type") == "installments"
+                          and len(x.get("amounts") or {}) == int(count)), None)
+            if match:
+                return match
+        if self.form.get("allow_partial"):
+            amount = float(self.form.get("partial_amount") or 0)
+            match = next((x for x in options if x.get("type") == "partial_then_remainder"
+                          and abs(float(next(iter(x.get("amounts", {0.0: 0.0}).values()))) - amount) < 0.01), None)
+            if match:
+                return match
+            rows = [x for x in options if x.get("type") == "partial_then_remainder"]
+            if rows:
+                return rows[0]
+        # No method was picked explicitly: when the profile keeps installments
+        # as a considered method, the engine still evaluated one — discuss it.
+        if "installments" in self.assistant._profile_allowed_methods():
+            rows = [x for x in options if x.get("type") == "installments"]
+            if rows:
+                return min(rows, key=lambda x: len(x.get("amounts") or {}))
+        return None
+
+    def _plan_reject_lines(self, result, row):
+        """Why the user's chosen plan fails: payment size against income, first dip below the minimum."""
+        schedule = sorted((str(day), float(value)) for day, value in (row.get("amounts") or {}).items())
+        if not schedule:
+            return []
+        count = row.get("count") or len(schedule)
+        per = schedule[0][1]
+        minimum = float(result["situation"]["minimum_balance"])
+        lines = []
+        facts = self._income_facts(result)
+        monthly = sum(float(fact["monthly"]) for fact in facts)
+        if per > 0 and monthly > 0:
+            ratio = per / monthly
+            if len(facts) == 1:
+                category = str(facts[0].get("category") or "").strip().lower()
+                word = "salary" if category == "salary" else self._CATEGORY_WORDS.get(category, "income")
+                income_name = f"your monthly {word} of {self._prose(monthly)}"
+            else:
+                income_name = f"your counted monthly income of {self._prose(monthly)}"
+            if ratio >= 1.95:
+                comparison = f"about {max(2, round(ratio))} times {income_name}"
+            elif ratio >= 1.05:
+                comparison = f"more than {income_name}"
+            elif ratio >= 0.75:
+                comparison = f"about the size of {income_name}"
+            else:
+                comparison = f"about {round(ratio * 100)}% of {income_name}"
+            lines.append(f"{count} payments of {self._prose(per)} are {comparison}.")
+        baseline = result.get("evidence", {}).get("balances", {})
+        first_below = row.get("lowest_projected_date")
+        for day in sorted(baseline):
+            paid = sum(value for pday, value in schedule if pday <= day)
+            if float(baseline[day]) - paid < minimum - 1e-9:
+                first_below = day
+                break
+        if first_below:
+            paid = sum(value for pday, value in schedule if pday <= str(first_below))
+            dip = float(baseline.get(str(first_below), 0.0)) - paid
+            lines.append(f"With these payments the balance first falls below your minimum of "
+                         f"{self._prose(minimum)} on {self._short(first_below)}, reaching about {self._prose(dip)}.")
+        return lines
+
     def _why_section(self, result):
         situation = result["situation"]
         breakdown = result.get("evidence", {}).get("breakdown", {})
@@ -1203,22 +1526,28 @@ class TerminalSession:
             chosen = None
         minimum = float(situation["minimum_balance"])
         if chosen is None:
-            full = next((x for x in result.get("ranked_options", []) if x["type"] == "pay_in_full_now"), None)
-            if full:
-                low_value, low_day = full["lowest_projected_balance"], full["lowest_projected_date"]
-                below = minimum - low_value
-                if below > 0.005:
-                    lines.append(f"Paying {self._prose(self.form['amount'])} in full now would take you to "
-                                 f"{self._prose(low_value)} on {self._short(low_day)}, {self._prose(below)} below "
-                                 f"your minimum, so the full payment does not fit in the next 90 days.")
-                elif below > 0:
-                    lines.append(f"Paying {self._prose(self.form['amount'])} in full now would take you to "
-                                 f"{self._prose(low_value)} on {self._short(low_day)}, just under "
-                                 f"your minimum, so the full payment does not fit in the next 90 days.")
-                else:
-                    lines.append(f"Paying {self._prose(self.form['amount'])} in full now would keep your lowest "
-                                 f"balance at {self._prose(low_value)} on {self._short(low_day)}, "
-                                 f"{self._margin_words(-below)}.")
+            plan_row = self._user_plan_row(result)
+            if plan_row is not None:
+                # The user chose a plan (or the profile keeps one): explain the
+                # verdict with that plan, never with "pay in full" alone.
+                lines.extend(self._plan_reject_lines(result, plan_row))
+            else:
+                full = next((x for x in result.get("ranked_options", []) if x["type"] == "pay_in_full_now"), None)
+                if full:
+                    low_value, low_day = full["lowest_projected_balance"], full["lowest_projected_date"]
+                    below = minimum - low_value
+                    if below > 0.005:
+                        lines.append(f"Paying {self._prose(self.form['amount'])} in full now would take you to "
+                                     f"{self._prose(low_value)} on {self._short(low_day)}, {self._prose(below)} below "
+                                     f"your minimum, so the full payment does not fit in the next 90 days.")
+                    elif below > 0:
+                        lines.append(f"Paying {self._prose(self.form['amount'])} in full now would take you to "
+                                     f"{self._prose(low_value)} on {self._short(low_day)}, just under "
+                                     f"your minimum, so the full payment does not fit in the next 90 days.")
+                    else:
+                        lines.append(f"Paying {self._prose(self.form['amount'])} in full now would keep your lowest "
+                                     f"balance at {self._prose(low_value)} on {self._short(low_day)}, "
+                                     f"{self._margin_words(-below)}.")
         else:
             low_value, low_day = self._plan_effect_low(result, chosen)
             margin = low_value - minimum
@@ -1434,13 +1763,24 @@ class TerminalSession:
         #    computed from the situation's room, not capped at the request.
         #    Floored to cents so the quoted amount really is safe to pay.
         try:
-            capacity = self._floor_cents(max(0.0, float(situation["lowest_projected_balance"]) - minimum))
+            # Use the no-payment engine situation here.  The advisory result's
+            # evidence may describe a requested scenario, while this line is
+            # specifically the independent amount-safe-today capacity.
+            baseline_situation = self.assistant.situation()
+            capacity = self._floor_cents(max(0.0, float(baseline_situation["lowest_projected_balance"]) -
+                                             float(baseline_situation["minimum_balance"])))
         except (KeyError, TypeError, ValueError):
             capacity = 0.0
         if capacity > 0:
             lines.append(f"You could pay up to {self._prose(capacity)} today and stay above your minimum.")
         else:
             lines.append("Right now no payment amount keeps you above your minimum without new income.")
+        # When nothing was affordable and the user chose a plan (installments
+        # or a split), explain the failure with that plan's own payments.
+        if not_recommended:
+            plan_row = self._user_plan_row(result)
+            if plan_row is not None:
+                lines.extend(self._plan_reject_lines(result, plan_row))
         # 6. Which accepted-method or deadline rule blocks a safe full payment.
         rules = []
         if full_safe and "full_payment" not in allowed:
@@ -1470,7 +1810,7 @@ class TerminalSession:
         elif chosen["type"] == "pay_in_full_now": verdict = "PAY IN FULL TODAY"
         elif chosen["type"] == "installments": verdict = f"PAY IN {self.form.get('installment_count', 3)} INSTALLMENTS"
         elif chosen["type"] == "split": verdict = f"SPLIT INTO {chosen.get('count', 2)} EQUAL PAYMENTS"
-        elif chosen["type"] == "partial_then_remainder": verdict = f"PAY {money(next(iter(chosen['amounts'].values())), currency)} NOW AND THE REST ON {list(chosen['amounts'])[-1]}"
+        elif chosen["type"] == "partial_then_remainder": verdict = f"PAY {self._money(next(iter(chosen['amounts'].values())), currency)} NOW AND THE REST ON {list(chosen['amounts'])[-1]}"
         elif chosen["type"] == "wait": verdict = f"WAIT UNTIL {max(chosen['dates'])}"
         else: verdict = "NOT RECOMMENDED"
         situation = result["situation"]
@@ -1486,16 +1826,16 @@ class TerminalSession:
             below = max(0.0, float(minimum) - float(option["lowest_projected_balance"]))
             # A shortfall that rounds to 0.00 is a hair under the minimum, not
             # "0.00 below" it; say that instead of printing a contradiction.
-            shortfall = (f"{money(below,currency)} below the minimum" if below > 0.005
+            shortfall = (f"{self._money(below,currency)} below the minimum" if below > 0.005
                          else "just under the minimum")
             safety = "SAFE" if option.get("safe") else (
-                f"(drops to {money(option['lowest_projected_balance'],currency)} on "
+                f"(drops to {self._money(option['lowest_projected_balance'],currency)} on "
                 f"{option['lowest_projected_date']}, {shortfall})"
             )
             meets = option.get("meets_deadline")
             meets = "n/a" if meets is None else ("yes" if meets else "no")
             name = option.get("label") or option["type"].replace("_", " ")
-            rows.append(f"{name:22} {', '.join(option['dates']):20} {money(option['total_cost'],currency):16} {money(option['lowest_projected_balance'],currency):16} {meets}   {safe_mark} {'SAFE' if option.get('safe') else 'UNSAFE'}")
+            rows.append(f"{name:22} {', '.join(option['dates']):20} {self._money(option['total_cost'],currency):16} {self._money(option['lowest_projected_balance'],currency):16} {meets}   {safe_mark} {'SAFE' if option.get('safe') else 'UNSAFE'}")
             if not option.get("safe"):
                 rows.append(f"                         Note: {safety}")
         allowed_types = {{"full_payment": "pay_in_full_now", "partial_payment": "partial_then_remainder",
@@ -1525,7 +1865,7 @@ class TerminalSession:
             buffer = situation["lowest_projected_balance"] - minimum
             if buffer > 0.005:
                 alts.append(
-                    f"Projected lowest balance stays {money(buffer, currency)} above your required minimum "
+                    f"Projected lowest balance stays {self._money(buffer, currency)} above your required minimum "
                     f"on {situation['lowest_projected_date']}."
                 )
             else:
@@ -1534,6 +1874,10 @@ class TerminalSession:
                     f"on {situation['lowest_projected_date']}."
                 )
         elif verdict.startswith("NOT RECOMMENDED"):
+            snapshot = getattr(self, "_snapshot", None)
+            if snapshot and snapshot.get("skip"):
+                alts.append(f"What would fit: {snapshot['fit']}.")
+                alts.append("Ask about a smaller amount.")
             split_eval = result.get("split_evaluation") or {}
             if split_eval and not split_eval.get("suggested"):
                 horizon = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
@@ -1547,7 +1891,7 @@ class TerminalSession:
             if full_now and "full_payment" not in self.assistant._profile_allowed_methods():
                 alts.append("Paying in full today would be safe, but it isn't among the payment methods you accept.")
             if safe_today > 0:
-                alts.append(f"Amount safe to pay today: {money(safe_today, currency)} (downsized purchase).")
+                alts.append(f"Amount safe to pay today: {self._money(safe_today, currency)} (downsized purchase).")
             if earliest and earliest > self.as_of_date:
                 alts.append(f"Earliest safe date to wait for: {earliest}.")
             if other_safe_names:
@@ -1558,7 +1902,7 @@ class TerminalSession:
                 alts.append("No safe alternative within the 90-day forecast. Consider reducing the amount or deferring.")
         elif "WAIT" in verdict:
             if safe_today > 0:
-                alts.append(f"Amount safe to pay today: {money(safe_today, currency)} (partial payment).")
+                alts.append(f"Amount safe to pay today: {self._money(safe_today, currency)} (partial payment).")
             if other_safe_names:
                 alts.append(f"Other safe options: {', '.join(other_safe_names)}.")
             if spending_changes != "none":
@@ -1601,8 +1945,10 @@ class TerminalSession:
             ]
         elif verdict.startswith("NOT RECOMMENDED"):
             steps = ["Do not make this payment now"]
+            if getattr(self, "_snapshot", None) and self._snapshot.get("skip"):
+                steps.append("Ask about a smaller amount to see a plan for it.")
             if safe_today > 0:
-                steps.append(f"Amount safe to pay today: {money(safe_today, currency)}.")
+                steps.append(f"Amount safe to pay today: {self._money(safe_today, currency)}.")
             if earliest:
                 steps.append(f"Earliest safe date: {earliest}.")
             steps.append(
@@ -1611,15 +1957,15 @@ class TerminalSession:
             )
         elif verdict.startswith("PAY IN FULL TODAY"):
             steps = [
-                f"Confirm the selected plan for {money(self.form['amount'], currency)}.",
-                f"Keep the minimum balance of {money(minimum, currency)} available in your account.",
+                f"Confirm the selected plan for {self._money(self.form['amount'], currency)}.",
+                f"Keep the minimum balance of {self._money(minimum, currency)} available in your account.",
                 "Recheck the forecast before making the payment if unexpected expenses occur.",
             ]
         elif "WAIT" in verdict:
             chosen_date = max(chosen["dates"]) if chosen and chosen.get("dates") else (earliest or "the safe date")
             steps = [
                 f"Hold the payment until {chosen_date}; do not pay in full today.",
-                f"Ensure minimum balance of {money(minimum, currency)} remains protected.",
+                f"Ensure minimum balance of {self._money(minimum, currency)} remains protected.",
                 "Recheck your balance before the safe date to ensure expected income arrived.",
             ]
         elif verdict.startswith("SPLIT INTO"):
@@ -1629,21 +1975,21 @@ class TerminalSession:
             last = entries[-1][1] if entries else per
             date_text = ", ".join(day for day, _value in entries)
             steps = [
-                f"Confirm the {count}-payment split for {money(self.form['amount'], currency)}.",
-                f"Pay {money(per, currency)} on {date_text}; the last payment is {money(last, currency)}.",
-                f"Total with the {float(self.form.get('split_fee_pct') or 0):g}% fee is {money(chosen.get('total_cost', 0), currency)}; keep {money(minimum, currency)} available.",
+                f"Confirm the {count}-payment split for {self._money(self.form['amount'], currency)}.",
+                f"Pay {self._money(per, currency)} on {date_text}; the last payment is {self._money(last, currency)}.",
+                f"Total with the {float(self.form.get('split_fee_pct') or 0):g}% fee is {self._money(chosen.get('total_cost', 0), currency)}; keep {self._money(minimum, currency)} available.",
             ]
         elif "INSTALLMENTS" in verdict:
             count = self.form.get("installment_count", 3)
             steps = [
-                f"Confirm the {count}-installment plan for {money(self.form['amount'], currency)}.",
-                f"Ensure sufficient funds on each monthly due date while maintaining {money(minimum, currency)}.",
+                f"Confirm the {count}-installment plan for {self._money(self.form['amount'], currency)}.",
+                f"Ensure sufficient funds on each monthly due date while maintaining {self._money(minimum, currency)}.",
                 "Recheck the forecast before making each scheduled payment.",
             ]
         else:
             steps = [
-                f"Confirm the selected plan for {money(self.form['amount'], currency)}.",
-                f"Keep the minimum balance of {money(minimum, currency)} available.",
+                f"Confirm the selected plan for {self._money(self.form['amount'], currency)}.",
+                f"Keep the minimum balance of {self._money(minimum, currency)} available.",
                 "Recheck the forecast before making the payment.",
             ]
         dates = list(balances)
@@ -1651,7 +1997,7 @@ class TerminalSession:
         end_date = dates[-1] if dates else (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
         start_balance = vals[0] if vals else situation["current_balance"]
         end_balance = vals[-1] if vals else situation["current_balance"]
-        return (f"╭─ {verdict} ─╮\nWHY\n{why}\n\nNUMBERS\n90-day balance: {spark}\nMinimum-balance level: {money(minimum,currency)}\n{start_date} {money(start_balance,currency)} → {end_date} {money(end_balance,currency)}\n\nOPTIONS\n" + "\n".join(rows) + "\n\nALTERNATIVES\n" + "\n".join("• "+s for s in alts) + "\n\nNEXT STEPS\n" + "\n".join("• "+s for s in steps) + "\n╰" + "─" * max(10, len(verdict) + 4) + "╯")
+        return (f"╭─ {verdict} ─╮\nWHY\n{why}\n\nNUMBERS\n90-day balance: {spark}\nMinimum-balance level: {self._money(minimum,currency)}\n{start_date} {self._money(start_balance,currency)} → {end_date} {self._money(end_balance,currency)}\n\nOPTIONS\n" + "\n".join(rows) + "\n\nALTERNATIVES\n" + "\n".join("• "+s for s in alts) + "\n\nNEXT STEPS\n" + "\n".join("• "+s for s in steps) + "\n╰" + "─" * max(10, len(verdict) + 4) + "╯")
 
     def report_data(self, result):
         rendered = self.render_report(result)
@@ -1675,11 +2021,11 @@ class TerminalSession:
         for item in result.get("ranked_options", []):
             low = item.get("lowest_projected_balance")
             options.append({"name": item.get("label") or item.get("type", "").replace("_", " "), "when": ", ".join(item.get("dates", [])),
-                            "cost": money(item.get("total_cost", 0), self.form["currency"]),
-                            "lowest": money(low, self.form["currency"]),
+                            "cost": self._money(item.get("total_cost", 0), self.form["currency"]),
+                            "lowest": self._money(low, self.form["currency"]),
                             "meets_deadline": "n/a" if item.get("meets_deadline") is None else ("yes" if item.get("meets_deadline") else "no"),
                             "safe": bool(item.get("safe")),
-                            "note": "" if item.get("safe") else f"Unsafe: drops to {money(low, self.form['currency'])} on {item.get('lowest_projected_date')}"})
+                            "note": "" if item.get("safe") else f"Unsafe: drops to {self._money(low, self.form['currency'])} on {item.get('lowest_projected_date')}"})
         sections = rendered.split("\n\nALTERNATIVES\n")
         alternatives = sections[-1].split("\n\nNEXT STEPS\n")[0].splitlines() if len(sections) > 1 else []
         next_steps = rendered.split("\n\nNEXT STEPS\n", 1)[-1].split("\n╰", 1)[0].splitlines()
@@ -1713,21 +2059,21 @@ class TerminalSession:
         capacity = self._floor_cents(max(0.0, low_bal - min_bal))
         if is_balance and is_afford:
             resp = (
-                f"Your current available balance is {money(curr_bal, currency)}. "
-                f"The most expensive payment you can safely afford right now is {money(capacity, currency)}. "
-                f"Over the next 90 days, your lowest projected balance is {money(low_bal, currency)} on {low_date}, "
-                f"keeping you at or above your required minimum balance of {money(min_bal, currency)}."
+                f"Your current available balance is {fmt_money(curr_bal, currency)}. "
+                f"The most expensive payment you can safely afford right now is {fmt_money(capacity, currency)}. "
+                f"Over the next 90 days, your lowest projected balance is {fmt_money(low_bal, currency)} on {low_date}, "
+                f"keeping you at or above your required minimum balance of {fmt_money(min_bal, currency)}."
             )
         elif is_balance:
             resp = (
-                f"Your current available balance is {money(curr_bal, currency)} "
-                f"(minimum balance requirement: {money(min_bal, currency)})."
+                f"Your current available balance is {fmt_money(curr_bal, currency)} "
+                f"(minimum balance requirement: {fmt_money(min_bal, currency)})."
             )
         else:
             resp = (
-                f"The most expensive payment you can safely afford right now is {money(capacity, currency)}. "
-                f"Over the next 90 days, your lowest projected balance is {money(low_bal, currency)} on {low_date}, "
-                f"leaving a safe margin above your required minimum balance of {money(min_bal, currency)}."
+                f"The most expensive payment you can safely afford right now is {fmt_money(capacity, currency)}. "
+                f"Over the next 90 days, your lowest projected balance is {fmt_money(low_bal, currency)} on {low_date}, "
+                f"leaving a safe margin above your required minimum balance of {fmt_money(min_bal, currency)}."
             )
         self._block("text", resp)
         return self.last_blocks
@@ -1777,7 +2123,7 @@ class TerminalSession:
             profiles = self.assistant.engine.profiles
             if requested:
                 profiles = profiles[profiles.home_currency.astype(str).str.upper().eq(requested)]
-            lines = [f"{uid} · {row.home_currency} · {money(row.current_available_balance, row.home_currency)}"
+            lines = [f"{uid} · {row.home_currency} · {fmt_money(row.current_available_balance, row.home_currency)}"
                      for uid, row in profiles.head(8).iterrows()]
             self._block("text", "Accounts" + (f" in {requested}" if requested else "") + ":\n" + ("\n".join(lines) or "No matching accounts."))
         elif command == "/export":
@@ -1790,14 +2136,15 @@ class TerminalSession:
             outflows = s.get("committed_outflows_next_30_days", s.get("outflows_next_30_days", s.get("outflows_next_30", 0)))
             outflows90 = s.get("committed_outflows_next_90_days", s.get("outflows_next_90_days", s.get("outflows_next_90", 0)))
             pending = s.get("pending_items", s.get("pending_items_considered_or_ignored", {}))
-            self._block("text", (f"Balance: {money(s['current_balance'],c)}; minimum: {money(s['minimum_balance'],c)}; "
-                                  f"lowest projected balance: {money(s['lowest_projected_balance'],c)} on {s.get('lowest_projected_date', 'n/a')}; "
-                                  f"income counted: {money(s.get('monthly_income_total', 0),c)}; "
-                                  f"outflows next 30 days: {money(outflows,c)}; next 90 days: {money(outflows90,c)}; "
+            self._block("text", (f"Balance: {fmt_money(s['current_balance'],c)}; minimum: {fmt_money(s['minimum_balance'],c)}; "
+                                  f"lowest projected balance: {fmt_money(s['lowest_projected_balance'],c)} on {s.get('lowest_projected_date', 'n/a')}; "
+                                  f"income counted: {fmt_money(s.get('monthly_income_total', 0),c)}; "
+                                  f"outflows next 30 days: {fmt_money(outflows,c)}; next 90 days: {fmt_money(outflows90,c)}; "
                                   f"pending items: {pending}; as of {self.as_of_date}."))
         elif command == "/reset":
             self.phase = "ready"; self.form = {}; self.questions = []; self.report = None
             self._conversion_note = None
+            self._snapshot = None
             self._block("text", "Session reset. What are you considering?")
         elif command == "/user": self._block("text", "Usage: /user <id>")
         elif command.startswith("/user "):
@@ -1829,7 +2176,7 @@ class TerminalSession:
         elif self.phase == "amount_clarification":
             amount, _ = parse_amount(text)
             if amount not in getattr(self, "_amount_choices", []):
-                self._block("prompt", f"Which amount did you mean: {' or '.join(money(x, self.assistant.engine.get_user_home_currency(self.user_id)) for x in self._amount_choices)}?")
+                self._block("prompt", f"Which amount did you mean: {' or '.join(fmt_money(x, self.assistant.engine.get_user_home_currency(self.user_id)) for x in self._amount_choices)}?")
             else:
                 self.phase = "ready"
                 self._forced_amount = amount
@@ -1907,9 +2254,8 @@ class TerminalSession:
         result = result or {}
         current = {
             "verdict": self.report_data(result).get("verdict", "n/a"),
-            "amount safe today": money(self._floor_cents(result.get("decision", {}).get("amount_safe_to_pay", 0) or 0),
-                                       self.form.get("currency", "INR")),
-            "lowest balance": money(result.get("situation", {}).get("lowest_projected_balance", 0), self.form.get("currency", "INR")),
+            "amount safe today": self._money(self._floor_cents(result.get("decision", {}).get("amount_safe_to_pay", 0) or 0)),
+            "lowest balance": self._money(result.get("situation", {}).get("lowest_projected_balance", 0)),
         }
         if previous is None:
             return "\n".join(f"{key}: {value}" for key, value in current.items())
@@ -1964,7 +2310,7 @@ class TerminalSession:
         if not row["safe"]:
             self._no_change_reason_cached = (
                 f"{count} payments would drop the balance to "
-                f"{money(row['lowest_projected_balance'], self.form.get('currency', 'INR'))} on "
+                f"{self._money(row['lowest_projected_balance'])} on "
                 f"{row['lowest_projected_date']}, below your minimum")
             return "nochange"
         self.form["split_count"] = count
@@ -1992,8 +2338,8 @@ class TerminalSession:
             return "nochange"
         # Preserve the old report values before updating the shared form.
         self._previous_verdict = self.report_data(self.report).get("verdict", "n/a")
-        self._previous_safe = money(self.report.get("decision", {}).get("amount_safe_to_pay", 0), self.form.get("currency", "INR"))
-        self._previous_low = money(self.report.get("situation", {}).get("lowest_projected_balance", 0), self.form.get("currency", "INR"))
+        self._previous_safe = self._money(self.report.get("decision", {}).get("amount_safe_to_pay", 0))
+        self._previous_low = self._money(self.report.get("situation", {}).get("lowest_projected_balance", 0))
         if self.form.get("allow_split"):
             outcome = self._split_amendment(low)
             if outcome is not None:

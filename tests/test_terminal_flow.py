@@ -5,7 +5,7 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "code"))
-from terminal_flow import TerminalSession, parse_amount
+from terminal_flow import TerminalSession, fmt_money, parse_amount
 from plan_dates import installment_completion_date
 
 
@@ -98,7 +98,7 @@ def test_report_verdict_controls_steps_and_pending_items_are_reported_once():
     next_steps = report.split("NEXT STEPS\n", 1)[1]
     assert "NOT RECOMMENDED" in report
     assert "Do not make this payment now" in next_steps
-    assert "Amount safe to pay today: INR 2,500.00" in next_steps
+    assert "Amount safe to pay today: ₹2,500.00" in next_steps
     assert "Earliest safe date:" in next_steps
     assert "income resumes" in next_steps and "smaller amount" in next_steps
     assert "reduce dining out" in next_steps
@@ -163,7 +163,7 @@ def test_deadline_answer_filters_later_installments_and_why_users_are_evidence_b
                   "Options considered:", "Wording: plain text", "Failproof session: chat-"):
         assert label in why
     users = demo.handle("/users INR")[0]["text"]
-    assert "user_07 · INR · INR" in users
+    assert "user_07 · INR · ₹" in users
     assert len(users.splitlines()) <= 9
 
 
@@ -259,10 +259,10 @@ def test_not_recommended_why_has_no_unqualified_safe_claim():
     session.handle("Laptop 500000 no deadline just advise")
     assert "NOT RECOMMENDED" in render_headline(session)
     text = session.handle("why not now")[0]["text"]
-    assert "No — you cannot pay the full ₹500,000 today." in text
+    assert "No — you cannot pay the full ₹5,00,000 today." in text
     assert "would be safe" not in text
     assert "below your minimum" in text
-    assert "You could pay up to ₹103,081 today and stay above your minimum." in text
+    assert "You could pay up to ₹1,03,081 today and stay above your minimum." in text
     assert "[" not in text
     assert text.splitlines()[-1] == ("Based on: your profile, your bank history and your salary pattern "
                                      "and your employer's update EMP-0005.")
@@ -336,7 +336,7 @@ def test_amount_candidates_table(text, expected):
 
 def test_ambiguous_and_negative_amount_messages_and_large_amount_warning():
     session = TerminalSession("user_07", "2025-11-04")
-    assert "Which amount did you mean: INR 12,000.00 or INR 5,000.00?" in session.handle("12k and 5k")[0]["text"]
+    assert "Which amount did you mean: ₹12,000.00 or ₹5,000.00?" in session.handle("12k and 5k")[0]["text"]
     assert session.handle("12k")[-1]["kind"] == "prompt"
     assert session.handle("-500")[0]["text"] == "Amounts must be positive; please enter an amount above zero."
     large_session = TerminalSession("user_07", "2025-11-04")
@@ -400,8 +400,8 @@ def test_situation_shows_actual_30_and_90_day_outflows():
     session = TerminalSession("user_07", "2024-09-04")
     text = session.handle("/situation")[0]["text"]
     situation = session.assistant.situation()
-    assert f"outflows next 30 days: INR {situation['committed_outflows_next_30_days']:,.2f}" in text
-    assert f"next 90 days: INR {situation['committed_outflows_next_90_days']:,.2f}" in text
+    assert f"outflows next 30 days: {fmt_money(situation['committed_outflows_next_30_days'], 'INR')}" in text
+    assert f"next 90 days: {fmt_money(situation['committed_outflows_next_90_days'], 'INR')}" in text
 
 
 def test_reported_phase_fresh_refrigerator_request():
@@ -433,12 +433,12 @@ def test_reported_phase_direct_account_questions():
     session = TerminalSession("user_07", "2025-11-04")
     session.handle("Laptop 12k no deadline just advise")
     assert session.phase == "reported"
-    from money import money
+    from terminal_flow import fmt_money
     situation = session.assistant.situation()
     currency = session.assistant.engine.get_user_home_currency("user_07")
-    expected_balance = money(situation["current_balance"], currency)
+    expected_balance = fmt_money(situation["current_balance"], currency)
     capacity = max(0.0, situation["lowest_projected_balance"] - situation["minimum_balance"])
-    expected_max = money(capacity, currency)
+    expected_max = fmt_money(capacity, currency)
 
     # 1. Bank balance question only
     blocks = session.handle("What is my current bank balance?")
@@ -529,7 +529,7 @@ def test_intake_skips_redundant_partial_and_fee_when_count_stated():
     assert session.questions == ["deadline"]
     assert session.form["allow_installments"] and session.form["installment_count"] == 6
     assert session.form["allow_partial"] is False
-    assert "Got it: INR 50,000.00" in blocks[0]["text"] and "6 installments" in blocks[0]["text"]
+    assert "Got it: ₹50,000.00" in blocks[0]["text"] and "6 installments" in blocks[0]["text"]
 
 
 def test_intake_asks_only_count_when_installments_already_chosen():
@@ -601,26 +601,26 @@ def test_foreign_currency_request_is_converted_once_and_shown_in_account_currenc
     session = TerminalSession("user_07", "2025-11-04")  # INR account
     blocks = session.handle("Laptop $100 no deadline just advise")
     ack = blocks[0]["text"]
-    assert ack.startswith("Got it: INR 8,333.00")
+    assert ack.startswith("Got it: ₹8,333.00")
     assert "$100 = ₹8,333 (rate 83.33)" in ack
     # The form is normalized to the account currency after one conversion.
     assert session.form["amount"] == 8333.0
     assert session.form["currency"] == "INR"
     report = blocks[-1]["text"]
     assert report.split("\n", 1)[0] == "╭─ PAY IN 3 INSTALLMENTS ─╮"
-    # No "$" on INR balances and no "USD" label on INR amounts anywhere.
+    # No "$" on ₹balances and no "USD" label on ₹amounts anywhere.
     assert "$" not in report
     assert "USD" not in report
-    assert "INR 8,333.00" in report          # OPTIONS total cost
-    assert "Minimum-balance level: INR 93,000.00" in report
-    assert "You have ₹218,946 available today" in report
+    assert "₹8,333.00" in report          # OPTIONS total cost
+    assert "Minimum-balance level: ₹93,000.00" in report
+    assert "You have ₹2,18,946 available today" in report
 
 
 def test_foreign_currency_request_without_a_rate_keeps_the_home_amount_question():
     session = TerminalSession("user_05", "2025-11-04")  # ZAR account, no INR rate
     blocks = session.handle("Laptop Rs 100 no deadline just advise")
     ack = blocks[0]["text"]
-    assert ack.startswith("Got it: INR 100.00")
+    assert ack.startswith("Got it: ₹100.00")
     assert "=" not in ack  # nothing was converted, so no conversion line
     assert blocks[-1]["kind"] == "error"
     assert ("Your account is in ZAR and I have no INR to ZAR rate. Type the amount in "
@@ -703,7 +703,7 @@ def test_profile_without_installments_refuses_named_installments():
     session = TerminalSession("user_33", "2025-11-04")  # full + partial, no installments
     blocks = session.handle("Can I pay Rs. 50,000 in 6 installments no deadline just advise")
     ack = blocks[0]["text"]
-    assert ack.startswith("Got it: INR 50,000.00")
+    assert ack.startswith("Got it: ₹50,000.00")
     assert "6 installments" not in ack
     joined = " ".join(block["text"] for block in blocks)
     assert "Your profile doesn't include installments, so I'll use paying in full instead." in joined

@@ -68,11 +68,12 @@ def test_clicking_deadline_option_advances_intake(monkeypatch):
     _offline(monkeypatch)
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
     at.chat_input[0].set_value("Laptop costs 12k").run()
-    # user_07's installments-only profile raises the deadline conflict directly.
+    # user_07's installments-only profile: no monthly plan finishes by that
+    # deadline, so the report explains the miss instead of asking a conflict.
     next(button for button in at.button if button.label.startswith("Within 14 days")).click().run()
-    assert "after your deadline" in "\n".join(x.value for x in at.markdown)
-    next(button for button in at.button if button.label.startswith("Remove the deadline")).click().run()
-    assert "how many installments" in "\n".join(x.value for x in at.markdown).lower()
+    markdown = "\n".join(x.value for x in at.markdown)
+    assert "No monthly installment plan finishes by" in markdown
+    assert "NOT RECOMMENDED" in markdown
 
 
 def test_date_picker_confirm_path(monkeypatch):
@@ -81,7 +82,7 @@ def test_date_picker_confirm_path(monkeypatch):
     at.chat_input[0].set_value("Laptop costs 12k").run()
     next(button for button in at.button if button.label.startswith("Pick a date")).click().run()
     assert len(at.date_input) == 1
-    at.date_input[0].set_value(dt.date(2025, 11, 20))
+    at.date_input[0].set_value(dt.date(2024, 11, 20))
     next(button for button in at.button if button.label == "Confirm date").click().run()
     assert not at.exception
     assert "installments" in "\n".join(x.value for x in at.markdown).lower()

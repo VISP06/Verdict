@@ -10,6 +10,8 @@ import re
 import failproofai_sdk as fp
 
 from assistant import Assistant
+from forecast import FORECAST_CONFIG
+from main import format_payment_plan
 from money import money
 from plan_dates import installment_completion_date
 
@@ -154,9 +156,9 @@ class TerminalSession:
         self.latest_wording = "plain text"
         self.last_blocks = []
         self._installment_count_given = False
-        self._conflict_reasks_installments = False
         self._no_change_reason_cached = None
         self._partial_safest_cache = None
+        self._split_classes_cache = None
         self._fee_invalid = False
         self._conversion_note = None
 
@@ -182,35 +184,160 @@ class TerminalSession:
         deadline = self.form.get("pay_by_date")
         if not deadline:
             return list(self.installment_counts)
-        return [count for count in self.installment_counts
+        # With a deadline every count from 2 up to the profile cap whose last
+        # payment (30-day spacing, first today) lands on or before the deadline
+        # is offered — not just the usual 3/6/12 menu.
+        cap = self.assistant._max_installment_months()
+        cap = 12 if cap is None else min(12, int(cap))
+        return [count for count in range(2, cap + 1)
                 if installment_completion_date(self.as_of_date, count) <= dt.date.fromisoformat(str(deadline)[:10])]
 
     def _installment_options_text(self):
         counts = self._eligible_installment_counts() or list(self.installment_counts)
         return "1 {} months (default)".format(counts[0]) + "".join(f", {idx + 2} {count} months" for idx, count in enumerate(counts[1:]))
 
-    def _installment_deadline_note(self):
-        """Say when the deadline rules out some installment counts, with real end dates."""
-        deadline = self.form.get("pay_by_date")
-        if not deadline:
-            return None
-        eligible = self._eligible_installment_counts()
-        full_counts = list(self.installment_counts)
-        if not eligible or len(eligible) >= len(full_counts):
-            return None
-        excluded = min(count for count in full_counts if count not in eligible)
-        count_text = ", ".join(str(count) for count in eligible[:-1]) + f" and {eligible[-1]}" if len(eligible) > 1 else str(eligible[0])
-        single_one = len(eligible) == 1 and eligible[0] == 1
-        noun = "monthly payment" if single_one else "monthly payments"
-        verb = "finishes" if single_one else "finish"
-        end = installment_completion_date(self.as_of_date, excluded)
-        end_text = end if isinstance(end, str) else end.isoformat()
-        return f"Only {count_text} {noun} {verb} by {deadline} (a {excluded}-month plan would end {end_text})."
-
     def _installment_deadline_message(self, deadline):
-        earliest = installment_completion_date(self.as_of_date, min(self.installment_counts))
-        return (f"No installment plan can finish by {deadline}; the shortest plan ends "
-                f"on {earliest}, after the deadline.")
+        return f"No monthly installment plan finishes by {deadline}."
+
+    def _swap_installments_for_split_offer(self, index):
+        """No monthly plan finishes by the deadline: replace the count question.
+
+        Profiles that accept partial payment get the split offer; otherwise the
+        count question is dropped and the report explains the deadline miss.
+        """
+        self._block("text", self._installment_deadline_message(self.form["pay_by_date"]))
+        if self._profile_allows_partial():
+            self.questions[index] = "split_offer"
+        else:
+            self.questions.pop(index)
+
+    def _split_window_days(self):
+        """Split window: the deadline, otherwise 30 days, capped at 90."""
+        deadline = self.form.get("pay_by_date")
+        if deadline:
+            window = (dt.date.fromisoformat(str(deadline)[:10]) - dt.date.fromisoformat(self.as_of_date)).days
+        else:
+            window = 30
+        return max(0, min(90, window))
+
+    @staticmethod
+    def _zero_decimal(currency):
+        return str(currency).upper() in {"IDR", "JPY", "KRW"}
+
+    def _split_amounts(self, count, window_days):
+        """Equal payments: per-payment rounds half up at currency granularity,
+        the last payment absorbs the rounding."""
+        fee = float(self.form.get("split_fee_pct") or 0)
+        total = round(float(self.form["amount"]) * (1.0 + fee / 100.0), 2)
+        factor = 1 if self._zero_decimal(self.form.get("currency")) else 100
+        per = math.floor(total / count * factor + 0.5) / factor
+        amounts = [per] * (count - 1) + [round(total - per * (count - 1), 2)]
+        return total, amounts
+
+    def _split_dates(self, count, window_days):
+        """Evenly spaced dates: first payment today, last on the deadline."""
+        as_of = dt.date.fromisoformat(self.as_of_date)
+        if count <= 1:
+            return [as_of.isoformat()]
+        return [(as_of + dt.timedelta(days=round(i * window_days / (count - 1)))).isoformat()
+                for i in range(count)]
+
+    def _split_income_classes(self):
+        """Income classes for split simulation, classified once per session."""
+        if self._split_classes_cache is None:
+            import pandas as pd
+            from income_classifier import IncomeClassifier
+            frame = pd.DataFrame([{"request_id": f"split_{self.run_id}", "user_id": self.user_id,
+                                   "request_date": self.as_of_date}])
+            self._split_classes_cache = IncomeClassifier(self.dataset_dir).classify_requests(
+                frame, environment="calibration", sleep_between_users=0)
+        return self._split_classes_cache
+
+    def _split_row(self, count, window_days, classes):
+        """One candidate split schedule, evaluated through the engine."""
+        total, amounts = self._split_amounts(count, window_days)
+        dates = self._split_dates(count, window_days)
+        schedule = dict(zip(dates, amounts))
+        balances, minimum = self.assistant.engine.simulate_90_days(
+            self.user_id, self.as_of_date, additional_payments=schedule,
+            income_classes=classes, **FORECAST_CONFIG)
+        low = min(balances.values())
+        low_date = min(balances, key=balances.get)
+        return {"type": "split", "count": count, "dates": dict(sorted(schedule.items())),
+                "amounts": dict(sorted(schedule.items())), "per_payment": amounts[0],
+                "total_cost": round(total, 2),
+                "lowest_projected_balance": round(low, 2), "lowest_projected_date": low_date,
+                "meets_deadline": (max(schedule) <= self.form["pay_by_date"]
+                                   if self.form.get("pay_by_date") else None),
+                "safe": low >= minimum - 1e-9, "minimum_balance": minimum,
+                "label": f"split {count} × {money(amounts[0], self.form.get('currency', 'INR'))}"}
+
+    def _evaluate_split(self):
+        """Evaluate evenly spaced equal-payment schedules through the engine.
+
+        Suggests the fewest payments whose schedule keeps the balance at or
+        above the minimum (equal counts as safe) and neighbours it.
+        """
+        window_days = self._split_window_days()
+        deadline = self.form.get("pay_by_date")
+        fee = float(self.form.get("split_fee_pct") or 0)
+        n_max = min(12, window_days // 7 + 1) if window_days >= 7 else 0
+        note = None
+        if not deadline:
+            note = "No deadline was given, so the split assumes a 30-day window."
+        elif window_days < 7:
+            note = (f"The window until {deadline} is only {window_days} day{'s' if window_days != 1 else ''}; "
+                    f"split payments must be at least 7 days apart.")
+        rows, safe_row = [], None
+        classes = None
+        forced = self.form.get("split_count")
+        if forced:
+            # A follow-up pinned the count ("make it 5 payments"): show it with
+            # its neighbours instead of re-suggesting the fewest.
+            centre = int(forced)
+            for count in (centre - 1, centre, centre + 1):
+                if not (2 <= count <= n_max):
+                    continue
+                if classes is None:
+                    classes = self._split_income_classes()
+                row = self._split_row(count, window_days, classes)
+                rows.append(row)
+                if count == centre:
+                    safe_row = row
+        else:
+            for count in range(2, n_max + 1):
+                if safe_row is not None and count > safe_row["count"] + 1:
+                    break
+                if classes is None:
+                    classes = self._split_income_classes()
+                row = self._split_row(count, window_days, classes)
+                rows.append(row)
+                if safe_row is None and row["safe"]:
+                    safe_row = row
+        return {"window_days": window_days, "deadline": deadline, "fee_pct": fee,
+                "n_max": n_max, "rows": rows, "suggested": safe_row, "window_note": note}
+
+    def _apply_split(self, result, split_eval):
+        """Fold the split evaluation into the advise result the report renders."""
+        result["split_evaluation"] = split_eval
+        row = result.setdefault("decision", {})
+        options = result.setdefault("ranked_options", [])
+        existing = {(item.get("type"), item.get("count"))
+                    for item in options if item.get("type") == "split"}
+        for item in split_eval.get("rows", []):
+            if (item.get("type"), item.get("count")) not in existing:
+                options.append(item)
+        suggested = split_eval.get("suggested")
+        if suggested is None or not suggested.get("safe"):
+            # No safe split: the honest outcome is NOT RECOMMENDED, whatever
+            # the engine ranked for the other methods.
+            row["affordability_status"] = "not_affordable"
+            result["recommended_option"] = None
+            return
+        result["recommended_option"] = suggested
+        row["affordability_status"] = "affordable_with_plan"
+        row["recommended_payment_method"] = "partial_payment"
+        row["payment_plan"] = format_payment_plan(suggested["dates"])
 
     def _has_installment_conflict(self, deadline):
         count = self.form.get("installment_count") if (self.form.get("allow_installments") and getattr(self, "_installment_count_given", False)) else None
@@ -253,15 +380,21 @@ class TerminalSession:
         question = self.questions[self.question_index]
         if question == "deadline_conflict":
             earliest = installment_completion_date(self.as_of_date, self.form["installment_count"])
-            text = f"The selected installment plan ends {earliest}, after that deadline. Choose 1 none, or type a date on or after {earliest}."
             low = earliest if isinstance(earliest, str) else earliest.isoformat()
             high = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
             options = [{"key": "1", "label": "Remove the deadline", "default": True}]
             if "full_payment" in self.assistant._profile_allowed_methods():
                 options.append({"key": "2", "label": "Pay in full today instead", "default": False})
+            # Deadlines are capped at 90 days, so a plan that ends beyond the
+            # horizon can only be resolved by removing the deadline or paying
+            # in full — no date picker in that case.
+            picker = None if low > high else {"label": "Or choose a later date", "min": low, "max": high}
+            text = (f"The selected installment plan ends {earliest}, after that deadline. Choose 1 none, or type a date on or after {earliest}."
+                    if picker else
+                    f"The selected installment plan ends {earliest}, after that deadline and beyond the 90-day forecast. Choose 1 none, or 2 pay in full today.")
             return self._block("prompt", text, {"question": f"That installment plan would finish on {low}, after your deadline. What would you like to do?",
                                                 "options": options,
-                                                "picker": {"label": "Or choose a later date", "min": low, "max": max(low, high)}})
+                                                "picker": picker})
         if question == "date":
             text = "Type a date in YYYY-MM-DD format."
             low = self.as_of_date
@@ -276,6 +409,8 @@ class TerminalSession:
                 entries.append(("3", "Pay part now and the rest later", False))
             if "installments" in allowed:
                 entries.append(("4", "Pay in installments", False))
+            if "partial_payment" in allowed:
+                entries.append(("5", "Split into equal payments", False))
             text = ("How would you like to pay? ["
                     + ", ".join(f"{key} {label}{' (default)' if default else ''}" for key, label, default in entries) + "]")
             return self._block("prompt", text, {"question": "How would you like to pay?",
@@ -288,6 +423,16 @@ class TerminalSession:
             choices = [("1", f"Pay {self._fmt(safest)} now (safest)", True), ("2", f"Pay {self._fmt(half)} now (half)", False)]
             return self._block("prompt", text, {"question": "How much do you want to pay now?",
                                                 "options": [{"key": key, "label": label, "default": default} for key, label, default in choices]})
+        if question == "split_offer":
+            text = "Would you like to split it into equal payments instead? [1 yes (default), 2 no]"
+            return self._block("prompt", text, {"question": "Would you like to split it into equal payments instead?",
+                                                "options": [{"key": "1", "label": "Yes, split it", "default": True},
+                                                            {"key": "2", "label": "No", "default": False}]})
+        if question == "split_fee":
+            text = "Optional split fee percentage? [Enter for 0% (default), or type your own up to 5%]"
+            choices = [("0", "No fee", True), ("1", "1% fee", False), ("2", "2% fee", False), ("5", "5% fee", False)]
+            return self._block("prompt", text, {"question": "Is there a fee for the split?",
+                                                "options": [{"key": key, "label": label, "default": default} for key, label, default in choices]})
         options = {
             "deadline": "When do you need to pay? [1 none (default), 2 within 14 days, 3 end of this month, 4 type YYYY-MM-DD]",
             "installments": f"How many installments? [{self._installment_options_text()}]",
@@ -297,11 +442,6 @@ class TerminalSession:
         clean_questions = {"deadline": "When do you need to pay?",
                            "installments": "How many installments?",
                            "fee": "Is there a fee for installments?"}
-        if question == "installments":
-            note = self._installment_deadline_note()
-            if note:
-                text = f"{text} {note}"
-                clean_questions["installments"] = f"How many installments? {note}"
         if question == "deadline": choices = [("1", "No deadline", True), ("2", "Within 14 days", False), ("3", "By the end of this month", False), ("4", "Pick a date…", False)]
         elif question == "installments":
             counts = self._eligible_installment_counts() or list(self.installment_counts)
@@ -461,10 +601,7 @@ class TerminalSession:
             # The count question is only queued once installments are chosen,
             # so a deadline that no plan can meet replaces it immediately.
             index = self.questions.index("installments")
-            self.questions[index] = "deadline_conflict"
-            self.form["installment_count"] = min(self.installment_counts)
-            self._conflict_reasks_installments = True
-            self._block("text", self._installment_deadline_message(self.form["pay_by_date"]))
+            self._swap_installments_for_split_offer(index)
         if amount > 1_000_000_000_000:
             self._block("text", "Warning: that amount is above 1,000,000,000,000; please check it carefully.")
         if self.questions:
@@ -572,15 +709,21 @@ class TerminalSession:
             method_choices["3"] = "partial"
         if "installments" in allowed:
             method_choices["4"] = "installments"
+        if "partial_payment" in allowed:
+            method_choices["5"] = "split"
         conflict_choices = {"1": None}
         if "full_payment" in allowed:
             conflict_choices["2"] = "full"
         choices = {"deadline": {"1": None, "2": "14", "3": "month", "4": "date"},
                    "deadline_conflict": conflict_choices, "method": method_choices,
-                   "installments": installment_choices}
+                   "installments": installment_choices,
+                   "split_offer": {"1": "yes", "2": "no"}}
         is_date = key == "date" or (key == "deadline_conflict" and value not in {"", "1"}
                                     and not (value == "2" and "2" in conflict_choices))
-        valid = value == "" or (key in choices and value in choices[key]) or (key == "fee" and bool(re.fullmatch(r"\d+(?:\.\d+)?", value)) and 0 <= float(value) <= 30)
+        fee_number = re.fullmatch(r"\d+(?:\.\d+)?", value)
+        valid = value == "" or (key in choices and value in choices[key]) \
+            or (key == "fee" and bool(fee_number) and 0 <= float(value) <= 30) \
+            or (key == "split_fee" and bool(fee_number) and 0 <= float(value) <= 5)
         partial_now = None
         if key == "partial_amount":
             if value in {"", "1"}:
@@ -601,10 +744,10 @@ class TerminalSession:
                 parsed_date = dt.date.fromisoformat(value)
                 as_of = dt.date.fromisoformat(self.as_of_date)
                 valid = parsed_date >= as_of
-                if valid and parsed_date > as_of + dt.timedelta(days=90):
-                    valid = True
                 if key == "deadline_conflict":
-                    valid = parsed_date >= installment_completion_date(self.as_of_date, self.form["installment_count"])
+                    # Kept deadlines are capped at 90 days like every other one.
+                    valid = (parsed_date >= installment_completion_date(self.as_of_date, self.form["installment_count"])
+                             and parsed_date <= as_of + dt.timedelta(days=90))
             except ValueError:
                 valid = False
         if not valid:
@@ -614,6 +757,8 @@ class TerminalSession:
                     self._block("text", f"Date must be on or after {self.as_of_date} and within the 90-day forecast.")
                 elif key == "partial_amount":
                     self._block("text", f"Enter an amount up to {self._fmt(self.form['amount'])}, or press Enter for the safest amount.")
+                elif key == "split_fee":
+                    self._block("text", "Maximum fee is 5%. Enter a percentage between 0 and 5, or press Enter for 0%.")
                 return [self._prompt()]
             value = ""
             if key == "partial_amount":
@@ -642,13 +787,13 @@ class TerminalSession:
                 self.form["pay_by_date"] = None
         elif key == "date":
             parsed = dt.date.fromisoformat(value) if value else None
-            if parsed and parsed > dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90):
-                self.form["pay_by_date"] = None
-                window_end = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
-                self._block("text", f"That date is beyond the 90-day forecast ending {window_end}; "
-                                    f"I'll use no deadline instead.")
-            else:
-                self.form["pay_by_date"] = parsed.isoformat() if parsed else None
+            horizon = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
+            if parsed and parsed.isoformat() > horizon:
+                # Never silently drop a too-late deadline: say the cap and re-ask.
+                self._block("text", f"Deadlines can be at most 90 days ahead (until {horizon}). "
+                                    f"Pick a date up to then, or choose no deadline for longer installment plans.")
+                return [self._prompt()]
+            self.form["pay_by_date"] = parsed.isoformat() if parsed else None
         elif key == "method":
             pick = method_choices.get(value, "decide")
             if pick == "full":
@@ -669,6 +814,12 @@ class TerminalSession:
                 self.questions.insert(self.question_index + 1, "installments")
                 if getattr(self, "_fee_invalid", False):
                     self.questions.insert(self.question_index + 2, "fee")
+            elif pick == "split":
+                self.form["allow_split"] = True
+                self.form["installments_declined"] = True
+                self.form["allow_partial"] = False
+                self.form["allow_installments"] = False
+                self.questions.insert(self.question_index + 1, "split_fee")
             else:
                 # Let Verdict decide: the engine ranks every allowed method.
                 self.form["allow_partial"] = self._profile_allows_partial()
@@ -688,15 +839,21 @@ class TerminalSession:
                 self._block("text", f"Only {self._fmt(safest)} is safe to pay today; using it.")
             self.form["allow_partial"] = True
             self.form["partial_amount"] = applied
+        elif key == "split_offer":
+            if value in {"", "1"}:
+                self.form["allow_split"] = True
+                self.form["installments_declined"] = True
+                self.form["allow_partial"] = False
+                self.form["allow_installments"] = False
+                self.questions.insert(self.question_index + 1, "split_fee")
+            else:
+                # No split: keep the deadline miss honest in the report.
+                self.form["installments_declined"] = True
+        elif key == "split_fee":
+            self.form["split_fee_pct"] = float(value) if value else 0.0
         elif key == "fee": self.form["installment_fee_pct"] = float(value) if value else 0.0
         self.question_index += 1
         blocks = []
-        if key == "deadline_conflict" and getattr(self, "_conflict_reasks_installments", False):
-            # The conflict question replaced a pending installments question;
-            # once the deadline is resolved the count still needs an answer.
-            self._conflict_reasks_installments = False
-            if value != "2" and "installments" not in self.questions[self.question_index:]:
-                self.questions.insert(self.question_index, "installments")
         if key in {"deadline", "deadline_conflict"} and self.form.get("pay_by_date") and self.form.get("allow_installments") and self._has_installment_conflict(self.form["pay_by_date"]):
             conflict_index = max(0, self.question_index - 1)
             self.questions[conflict_index] = "deadline_conflict"
@@ -711,25 +868,18 @@ class TerminalSession:
             # deadline that no plan can meet replaces it immediately — whether
             # the deadline came from the sentence or a typed answer.
             index = self.questions.index("installments", self.question_index)
-            self.questions[index] = "deadline_conflict"
-            self.form["installment_count"] = min(self.installment_counts)
-            self._conflict_reasks_installments = True
-            blocks.append(self._block("text", self._installment_deadline_message(self.form["pay_by_date"])))
+            self._swap_installments_for_split_offer(index)
         if key == "method" and self.form.get("allow_installments") and self.form.get("pay_by_date") \
                 and not self._eligible_installment_counts() \
                 and "installments" in self.questions[self.question_index:]:
             index = self.questions.index("installments", self.question_index)
-            self.questions[index] = "deadline_conflict"
-            self.form["installment_count"] = min(self.installment_counts)
-            self._conflict_reasks_installments = True
-            blocks.append(self._block("text", self._installment_deadline_message(self.form["pay_by_date"])))
+            self._swap_installments_for_split_offer(index)
         if key == "installments" and self._has_installment_conflict(self.form.get("pay_by_date")):
             # The user has now actually chosen installments, so a count that
             # cannot meet the kept deadline gets the same conflict question.
             conflict_index = max(0, self.question_index - 1)
             self.questions[conflict_index] = "deadline_conflict"
             self.question_index = conflict_index
-            self._conflict_reasks_installments = False
             self._block("text", f"The selected {self.form['installment_count']}-installment plan conflicts with the deadline {self.form['pay_by_date']}.")
             self._prompt()
             return self.last_blocks
@@ -751,6 +901,12 @@ class TerminalSession:
                     with fp.tool_call("advise", input={"user_id": self.user_id, "amount": self.form["amount"]}) as tool:
                         result = self.assistant.advise(self.form)
                         tool.output = result
+                    if self.form.get("allow_split"):
+                        with fp.tool_call("evaluate_split", input={"user_id": self.user_id}) as split_tool:
+                            split_eval = self._evaluate_split()
+                            split_tool.output = {"candidates": [row["count"] for row in split_eval["rows"]],
+                                                 "suggested": (split_eval["suggested"] or {}).get("count")}
+                        self._apply_split(result, split_eval)
             self.report = result
             self.latest_result = result
             self.latest_wording = "plain text"
@@ -1082,6 +1238,17 @@ class TerminalSession:
                 lines.append(f"Waiting until {self._short(wait_date)} to pay {amount_text} would take you to "
                              f"{self._prose(low_value)} on {self._short(low_day)}, {margin_text}, "
                              f"so waiting makes the payment safe.")
+            elif chosen["type"] == "split":
+                count = chosen.get("count", 2)
+                entries = sorted((chosen.get("amounts") or {}).items())
+                first_amount = self._prose(entries[0][1]) if entries else amount_text
+                last_date = max(chosen["dates"])
+                lines.append(f"Splitting {amount_text} into {count} equal payments of about {first_amount} until "
+                             f"{self._short(last_date)} would take you to {self._prose(low_value)} on "
+                             f"{self._short(low_day)}, {margin_text}, so the split stays safe.")
+                split_eval = result.get("split_evaluation") or {}
+                if split_eval.get("window_note"):
+                    lines.append(split_eval["window_note"])
             else:
                 entries = sorted(chosen["amounts"].items())
                 first_amount = self._prose(entries[0][1])
@@ -1119,6 +1286,10 @@ class TerminalSession:
             if "partial_payment" not in allowed:
                 return "partial payment is not among the payment methods you accept"
             return "paying the full amount today is already safe, so splitting it does not change the plan"
+        if self.form.get("allow_split"):
+            fee = re.search(r"\bfee\s+(\d+(?:\.\d+)?)\s*%?", low)
+            if fee:
+                return f"the split fee is now {float(fee.group(1)):g}%, which only changes the payment size"
         count = _followup_count(low)
         if count:
             if "installments" not in allowed:
@@ -1298,6 +1469,7 @@ class TerminalSession:
             verdict = "NOT RECOMMENDED: no option keeps your balance above the minimum"
         elif chosen["type"] == "pay_in_full_now": verdict = "PAY IN FULL TODAY"
         elif chosen["type"] == "installments": verdict = f"PAY IN {self.form.get('installment_count', 3)} INSTALLMENTS"
+        elif chosen["type"] == "split": verdict = f"SPLIT INTO {chosen.get('count', 2)} EQUAL PAYMENTS"
         elif chosen["type"] == "partial_then_remainder": verdict = f"PAY {money(next(iter(chosen['amounts'].values())), currency)} NOW AND THE REST ON {list(chosen['amounts'])[-1]}"
         elif chosen["type"] == "wait": verdict = f"WAIT UNTIL {max(chosen['dates'])}"
         else: verdict = "NOT RECOMMENDED"
@@ -1322,7 +1494,8 @@ class TerminalSession:
             )
             meets = option.get("meets_deadline")
             meets = "n/a" if meets is None else ("yes" if meets else "no")
-            rows.append(f"{option['type'].replace('_',' '):22} {', '.join(option['dates']):20} {money(option['total_cost'],currency):16} {money(option['lowest_projected_balance'],currency):16} {meets}   {safe_mark} {'SAFE' if option.get('safe') else 'UNSAFE'}")
+            name = option.get("label") or option["type"].replace("_", " ")
+            rows.append(f"{name:22} {', '.join(option['dates']):20} {money(option['total_cost'],currency):16} {money(option['lowest_projected_balance'],currency):16} {meets}   {safe_mark} {'SAFE' if option.get('safe') else 'UNSAFE'}")
             if not option.get("safe"):
                 rows.append(f"                         Note: {safety}")
         allowed_types = {{"full_payment": "pay_in_full_now", "partial_payment": "partial_then_remainder",
@@ -1361,6 +1534,15 @@ class TerminalSession:
                     f"on {situation['lowest_projected_date']}."
                 )
         elif verdict.startswith("NOT RECOMMENDED"):
+            split_eval = result.get("split_evaluation") or {}
+            if split_eval and not split_eval.get("suggested"):
+                horizon = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
+                n_max = split_eval.get("n_max", 0)
+                if n_max < 2:
+                    alts.append("Splitting into equal payments is not possible: payments must be at least 7 days apart.")
+                else:
+                    alts.append(f"No equal-payment split up to {n_max} payments keeps your balance above the minimum.")
+                alts.append(f"Pick a later deadline (up to {horizon}) or pay the safe amount today instead.")
             full_now = next((x for x in options if x.get("safe") and x["type"] == "pay_in_full_now"), None)
             if full_now and "full_payment" not in self.assistant._profile_allowed_methods():
                 alts.append("Paying in full today would be safe, but it isn't among the payment methods you accept.")
@@ -1383,6 +1565,14 @@ class TerminalSession:
                 alts.append(f"Spending changes to enable paying sooner: {spending_changes}.")
             if not alts:
                 alts.append(f"Waiting until {earliest} avoids dropping below your required minimum balance.")
+        elif verdict.startswith("SPLIT INTO"):
+            if other_safe_names:
+                alts.append(f"Other safe options: {', '.join(other_safe_names)}.")
+            full_now = next((x for x in options if x.get("safe") and x["type"] == "pay_in_full_now"), None)
+            if full_now and "full_payment" in self.assistant._profile_allowed_methods():
+                alts.append("Paying in full today is also safe and avoids any fee.")
+            if not alts:
+                alts.append("The split spreads the payment so your balance never dips below the minimum.")
         else:
             if ("full_payment" in self.assistant._profile_allowed_methods()
                     and earliest and earliest > self.as_of_date):
@@ -1432,6 +1622,17 @@ class TerminalSession:
                 f"Ensure minimum balance of {money(minimum, currency)} remains protected.",
                 "Recheck your balance before the safe date to ensure expected income arrived.",
             ]
+        elif verdict.startswith("SPLIT INTO"):
+            count = chosen.get("count", 2)
+            entries = sorted((chosen.get("dates") or {}).items())
+            per = chosen.get("per_payment", 0)
+            last = entries[-1][1] if entries else per
+            date_text = ", ".join(day for day, _value in entries)
+            steps = [
+                f"Confirm the {count}-payment split for {money(self.form['amount'], currency)}.",
+                f"Pay {money(per, currency)} on {date_text}; the last payment is {money(last, currency)}.",
+                f"Total with the {float(self.form.get('split_fee_pct') or 0):g}% fee is {money(chosen.get('total_cost', 0), currency)}; keep {money(minimum, currency)} available.",
+            ]
         elif "INSTALLMENTS" in verdict:
             count = self.form.get("installment_count", 3)
             steps = [
@@ -1473,7 +1674,7 @@ class TerminalSession:
         options = []
         for item in result.get("ranked_options", []):
             low = item.get("lowest_projected_balance")
-            options.append({"name": item.get("type", "").replace("_", " "), "when": ", ".join(item.get("dates", [])),
+            options.append({"name": item.get("label") or item.get("type", "").replace("_", " "), "when": ", ".join(item.get("dates", [])),
                             "cost": money(item.get("total_cost", 0), self.form["currency"]),
                             "lowest": money(low, self.form["currency"]),
                             "meets_deadline": "n/a" if item.get("meets_deadline") is None else ("yes" if item.get("meets_deadline") else "no"),
@@ -1549,6 +1750,12 @@ class TerminalSession:
         if _is_installment_count_followup(low):
             # "change number of installments to 3" & co. amend the prior request.
             return False
+        if self.form.get("allow_split"):
+            # Bare split amendments route to the split follow-up, not a new request.
+            if re.fullmatch(r"(?:make it\s+)?\d+\s+payments?", low):
+                return False
+            if re.fullmatch(r"fee\s+\d+(?:\.\d+)?\s*%?", low):
+                return False
         if (self.report is not None and not _CURRENCY_RE.search(low)
                 and not _PURCHASE_CUE_RE.search(low)
                 and re.search(r"\b(?:to|be|into)\s+\d", low)):
@@ -1630,10 +1837,13 @@ class TerminalSession:
         elif self.phase == "intake":
             new_amount, _ = parse_amount(text)
             current = self.questions[self.question_index] if self.question_index < len(self.questions) else None
-            is_answer = (text in {"", "1", "2", "3", "4"}
+            is_answer = (text in {"", "1", "2", "3", "4", "5"}
                          or (current == "fee" and bool(re.fullmatch(r"\d+(?:\.\d+)?", text)))
+                         or (current == "split_offer" and text in {"", "1", "2"})
+                         or (current == "split_fee" and (text == "" or bool(re.fullmatch(r"\d+(?:\.\d+)?", text))))
                          or (current == "partial_amount" and (text == "" or parse_amount(text)[0] is not None)))
-            if (self.question_index >= len(self.questions) or self.questions[self.question_index] != "fee") and re.search(r"(?<!\w)-\s*\d", text):
+            if (self.question_index >= len(self.questions)
+                    or self.questions[self.question_index] not in {"fee", "split_fee"}) and re.search(r"(?<!\w)-\s*\d", text):
                 self._block("error", "Amounts must be positive; please enter an amount above zero.")
             elif new_amount is not None and not is_answer:
                 self._block("text", "Starting a new request and resetting the current intake.")
@@ -1673,7 +1883,6 @@ class TerminalSession:
                     self.phase = "intake"
                     self.questions = ["deadline_conflict"]
                     self.question_index = 0
-                    self._conflict_reasks_installments = False
                     self._block("text", f"The selected {self.form['installment_count']}-installment plan conflicts with the deadline {self.form['pay_by_date']}.")
                     self._prompt()
                 elif outcome:
@@ -1711,6 +1920,56 @@ class TerminalSession:
         }
         return "\n".join(f"{key}: {old[key]} → {value}" for key, value in current.items())
 
+    def _split_current_count(self):
+        """The count of the split plan currently on the table."""
+        chosen = (self.report or {}).get("recommended_option") or {}
+        if chosen.get("type") == "split" and chosen.get("count"):
+            return int(chosen["count"])
+        return int(self.form.get("split_count") or 2)
+
+    def _split_amendment(self, low):
+        """Follow-ups that amend an active split; None when not split-related."""
+        fee = re.search(r"\bfee\s+(\d+(?:\.\d+)?)\s*%?", low)
+        if fee:
+            pct = float(fee.group(1))
+            if not (0 <= pct <= 5):
+                self._no_change_reason_cached = "the split fee must be between 0 and 5 percent"
+                return "nochange"
+            self.form["split_fee_pct"] = pct
+            return True
+        count_match = (re.search(r"\bmake it\s+(\d+)\s+payments?\b", low)
+                       or re.search(r"\bsplit\s+(?:it\s+)?into\s+(\d+)\b", low)
+                       or re.fullmatch(r"(\d+)\s+payments?", low))
+        if count_match:
+            return self._split_request_count(int(count_match.group(1)))
+        if re.search(r"\bmore payments?\b", low):
+            return self._split_request_count(self._split_current_count() + 1)
+        if re.search(r"\bfewer payments?\b", low):
+            return self._split_request_count(self._split_current_count() - 1)
+        return None
+
+    def _split_request_count(self, count):
+        """Apply a requested split count; refuse unsafe or out-of-range counts."""
+        count = int(count)
+        if count < 2:
+            self._no_change_reason_cached = "2 is the minimum; 1 would be paying in full"
+            return "nochange"
+        window_days = self._split_window_days()
+        n_max = min(12, window_days // 7 + 1) if window_days >= 7 else 0
+        if count > n_max:
+            self._no_change_reason_cached = (f"payments must be at least 7 days apart; the "
+                                             f"{window_days}-day window fits at most {n_max} payments")
+            return "nochange"
+        row = self._split_row(count, window_days, self._split_income_classes())
+        if not row["safe"]:
+            self._no_change_reason_cached = (
+                f"{count} payments would drop the balance to "
+                f"{money(row['lowest_projected_balance'], self.form.get('currency', 'INR'))} on "
+                f"{row['lowest_projected_date']}, below your minimum")
+            return "nochange"
+        self.form["split_count"] = count
+        return True
+
     def _apply_followup(self, text):
         value = str(text or "").strip()
         if not value:
@@ -1735,9 +1994,15 @@ class TerminalSession:
         self._previous_verdict = self.report_data(self.report).get("verdict", "n/a")
         self._previous_safe = money(self.report.get("decision", {}).get("amount_safe_to_pay", 0), self.form.get("currency", "INR"))
         self._previous_low = money(self.report.get("situation", {}).get("lowest_projected_balance", 0), self.form.get("currency", "INR"))
+        if self.form.get("allow_split"):
+            outcome = self._split_amendment(low)
+            if outcome is not None:
+                return outcome
         if "half" in low or re.search(r"\bpay\s+\d+(?:\.\d+)?\s*%\s+now\b", low) or re.search(r"\bpay\s+[\d,.]+\s*(?:k|thousand)?\s+now\b", low):
             self.form["allow_partial"] = True
             self.form["allow_installments"] = False
+            self.form.pop("allow_split", None)
+            self.form.pop("split_count", None)
             percent = re.search(r"\bpay\s+(\d+(?:\.\d+)?)\s*%\s+now\b", low)
             explicit = re.search(r"\bpay\s+([\d,.]+)\s*(k|thousand)?\s+now\b", low)
             if percent:
@@ -1759,6 +2024,8 @@ class TerminalSession:
             # deadline; it never re-asks intake questions.
             self.form.update(allow_installments=True, installment_count=count, allow_partial=False)
             self.form.pop("installments_declined", None)
+            self.form.pop("allow_split", None)
+            self.form.pop("split_count", None)
             self._installment_count_given = True
             self._installment_count_only = False
             cap = self.assistant._max_installment_months()
@@ -1781,9 +2048,16 @@ class TerminalSession:
             self.form["pay_by_date"] = date.isoformat()
             self.form["allow_partial"] = False
             self.form["allow_installments"] = False
+            self.form.pop("allow_split", None)
+            self.form.pop("split_count", None)
             return True
         iso = re.search(r"\bby\s+(20\d\d-\d\d-\d\d)\b", low)
         if iso:
+            horizon = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
+            if iso.group(1) > horizon:
+                self._no_change_reason_cached = (f"deadlines can be at most 90 days ahead (until {horizon}); "
+                                                 f"pick a date up to then, or choose no deadline")
+                return "nochange"
             self.form["pay_by_date"] = iso.group(1)
             return True
         new_amount, currency = parse_amount(value)

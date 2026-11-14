@@ -107,19 +107,17 @@ def test_report_verdict_controls_steps_and_pending_items_are_reported_once():
 
 def test_deadline_filters_installments_and_conflicting_deadline_reasks():
     # With a deadline but no method chosen, the intake asks the method question
-    # first; the conflict appears only after installments are actually chosen.
+    # first; once installments are chosen and no plan fits, the split is offered.
     session, blocks = start("Laptop 12k end of this month")
     assert session.form["pay_by_date"] == "2025-11-30"
-    assert not any("completes by" in block["text"] for block in blocks)
+    assert not any("finishes by" in block["text"] for block in blocks)
     assert "How would you like to pay?" in blocks[-1]["text"]
-    blocks = session.handle("4")  # installments chosen: the pending count question
-                                  # is replaced by the deadline conflict at once
-    assert any("No installment plan can finish by" in block["text"] for block in blocks)
-    blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
-    assert session.form["pay_by_date"] is None
-    assert "How many installments?" in blocks[-1]["text"]
-    blocks = session.handle("")
+    blocks = session.handle("4")  # installments chosen: no count completes in time
+    assert any("No monthly installment plan finishes by 2025-11-30" in block["text"] for block in blocks)
+    assert "Would you like to split it into equal payments instead?" in blocks[-1]["text"]
+    blocks = session.handle("2")  # decline the split -> the report keeps the deadline
     assert any(block["kind"] == "report" for block in blocks)
+    assert session.form["pay_by_date"] == "2025-11-30"
 
     # If an installment count was stated first, a conflicting deadline is rejected
     # and the replacement prompt allows only no deadline or a date after completion.
@@ -151,11 +149,11 @@ def test_installment_options_for_no_deadline_and_shared_completion_date():
 def test_deadline_answer_filters_later_installments_and_why_users_are_evidence_based(monkeypatch):
     session, _ = start("Laptop costs 12k")
     blocks = session.handle("3")  # end of this month
-    # No installments chosen yet: no conflict message, the intake continues.
-    assert not any("No installment plan can finish by" in block["text"] for block in blocks)
+    # No installments chosen yet: no miss message, the intake continues.
+    assert not any("No monthly installment plan finishes by" in block["text"] for block in blocks)
     assert "How would you like to pay?" in blocks[-1]["text"]
-    blocks = session.handle("4")  # installments chosen: conflict raised at once
-    assert any("No installment plan can finish by" in block["text"] for block in blocks)
+    blocks = session.handle("4")  # installments chosen: no count fits -> split offered
+    assert any("No monthly installment plan finishes by" in block["text"] for block in blocks)
 
     demo = TerminalSession("user_07", "2025-11-04")
     assert demo.assistant.engine.get_user_home_currency("user_07") == "INR"
@@ -356,9 +354,12 @@ def test_typed_deadline_validation_table(answer):
         assert any("on or after" in block["text"] for block in session.last_blocks)
     elif answer == "2026-02-10":
         assert session.form.get("pay_by_date") is None
-        # The message names the window end it falls back to, not a vague promise.
-        assert any("beyond the 90-day forecast ending 2026-02-02" in block["text"]
-                   and "no deadline" in block["text"] for block in session.last_blocks)
+        # A too-late date is never silently dropped: the cap is stated and the
+        # question is asked again.
+        assert any("Deadlines can be at most 90 days ahead (until 2026-02-02)" in block["text"]
+                   and "no deadline for longer installment plans" in block["text"]
+                   for block in session.last_blocks)
+        assert "Type a date" in blocks[-1]["text"]
     else:
         assert session.form.get("pay_by_date") in {"2025-11-06", "2025-11-18"}
 
@@ -538,9 +539,12 @@ def test_intake_asks_only_count_when_installments_already_chosen():
     assert "Is partial payment acceptable?" not in " ".join(b["text"] for b in blocks)
     prompt = blocks[-1]["text"]
     assert "No installments" not in prompt and "How many installments?" in prompt
-    assert "3 months" in prompt and "6 months" not in prompt  # only plans completing by the deadline
-    blocks = session.handle("")  # accepts the default plan
-    assert session.form["allow_installments"] and session.form["installment_count"] == 3
+    # With a deadline every count from 2 up to the cap whose plan completes in
+    # time is offered — counts 2 and 3 make it; the 6-month plan does not.
+    assert "1 2 months (default), 2 3 months" in prompt
+    assert "6 months" not in prompt
+    blocks = session.handle("")  # accepts the default: the fewest payments
+    assert session.form["allow_installments"] and session.form["installment_count"] == 2
     assert any(block["kind"] == "report" for block in blocks)
 
 
@@ -670,27 +674,27 @@ def test_unsafe_note_never_claims_a_zero_shortfall():
 
 # --- Deadline today / too short for any installment count, before the count menu ---
 
-def test_typed_deadline_too_short_for_any_plan_beats_the_count_menu():
+def test_typed_deadline_too_short_for_any_plan_reports_the_miss():
     session = TerminalSession("user_07", "2025-11-04")
     blocks = session.handle("Laptop 12k")
     session.handle("4")                   # pick a date
     blocks = session.handle("2025-11-04")  # deadline = today
     joined = " ".join(block["text"] for block in blocks)
-    assert "No installment plan can finish by 2025-11-04" in joined
+    assert "No monthly installment plan finishes by 2025-11-04" in joined
     assert "How many installments?" not in joined
-    assert "deadline_conflict" in session.questions
-    blocks = session.handle("1")          # remove the deadline -> the count is asked
-    assert session.form["pay_by_date"] is None
-    assert "How many installments?" in blocks[-1]["text"]
+    assert "Would you like to split" not in joined  # user_07 accepts no partial payment
+    assert any(block["kind"] == "report" for block in blocks)
+    assert "NOT RECOMMENDED: no allowed plan completes by 2025-11-04" in blocks[-1]["text"]
 
 
-def test_in_sentence_today_deadline_conflicts_like_any_other_date():
+def test_in_sentence_today_deadline_reports_the_miss():
     session = TerminalSession("user_07", "2025-11-04")
     blocks = session.handle("Laptop 12k pay by today")
     joined = " ".join(block["text"] for block in blocks)
     assert session.form["pay_by_date"] == "2025-11-04"
-    assert "No installment plan can finish by 2025-11-04" in joined
+    assert "No monthly installment plan finishes by 2025-11-04" in joined
     assert "How many installments?" not in joined
+    assert any(block["kind"] == "report" for block in blocks)
 
 
 # --- A method the profile doesn't allow is refused with a fallback, not echoed ---

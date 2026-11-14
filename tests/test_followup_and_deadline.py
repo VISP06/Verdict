@@ -5,9 +5,11 @@ already on the table (same amount, same item, same deadline) instead of being
 parsed as a new INR 3.00 request, and a bare number after to/be/into with no
 currency and no purchase cue is never taken as a new amount.
 
-Bug 2: when no allowed installment plan completes by the kept deadline, the
-first flow's conflict question is asked instead of headlineing a late plan, and
-a report that still ends without a compliant option is NOT RECOMMENDED.
+Bug 2: when no allowed installment plan completes by the kept deadline and no
+count was named, the count question is replaced at once: profiles that accept
+partial payment get the split offer, installments-only profiles get a report
+that explains the miss and is NOT RECOMMENDED. A count that was named
+explicitly still resolves through the conflict question.
 
 Refinements: the conflict question only appears once installments are actually
 chosen (in the sentence or by answering "Use installments?"), the fallback
@@ -38,9 +40,8 @@ FAKE_USERS = (
     ("fx_partial", "partial_payment", ""),  # partial-only profile, no cap
 )
 AS_OF = "2024-09-05"
-# With the first installment paid on the as-of date: 3 -> 2024-11-04, 6 -> 2025-02-02.
+# With the first installment paid on the as-of date: 3 -> 2024-11-04.
 COUNT3_DATE = installment_completion_date(AS_OF, 3).isoformat()
-COUNT6_DATE = installment_completion_date(AS_OF, 6).isoformat()
 
 
 @pytest.fixture(scope="module")
@@ -187,21 +188,15 @@ def test_followup_without_compliant_plan_asks_conflict_question(fake_dataset):
     assert "PAY IN 6 INSTALLMENTS" in blocks[-1]["text"]
 
 
-def test_no_plan_completes_by_deadline_so_conflict_question_replaces_menu(fake_dataset):
+def test_no_plan_completes_by_deadline_so_the_report_says_so(fake_dataset):
+    # Installments-only profile (no partial payment): no split offer, the
+    # report explains the deadline miss and is NOT RECOMMENDED.
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Can I pay ₹50,000 in installments by 2024-09-20?")
-    assert any("No installment plan can finish by 2024-09-20" in block["text"] for block in blocks)
-    prompt = blocks[-1]
-    assert "after that deadline" in prompt["text"]
-    assert session.questions == ["deadline_conflict"]
-    assert not any(block["kind"] == "report" for block in blocks)
-
-    blocks = session.handle("1")  # remove the deadline
-    assert session.form["pay_by_date"] is None
-    assert "How many installments?" in blocks[-1]["text"]  # the count is asked again
-    blocks = session.handle("")  # default: the shortest plan
-    assert session.form["installment_count"] == 3
-    assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
+    assert any("No monthly installment plan finishes by 2024-09-20" in block["text"] for block in blocks)
+    assert not any(block["kind"] == "prompt" for block in blocks)
+    assert any(block["kind"] == "report" for block in blocks)
+    assert "NOT RECOMMENDED: no allowed plan completes by 2024-09-20" in blocks[-1]["text"]
 
 
 def test_skipping_the_conflict_gives_not_recommended_deadline_verdict(fake_dataset):
@@ -246,37 +241,36 @@ def test_conflict_prompt_offers_full_payment_only_when_profile_allows(fake_datas
 
 
 def test_installments_not_mentioned_before_asking_when_not_chosen(fake_dataset):
-    # The installments-only profile states its rule instead of asking, and the
-    # pending count question is raised as a deadline conflict right away.
+    # The installments-only profile states its rule instead of asking; with a
+    # deadline no plan can meet, the report explains the miss directly.
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Laptop 12k end of this month")
     assert session.form["pay_by_date"] == "2024-09-30"
     joined = " ".join(block["text"] for block in blocks)
     assert "Your profile only allows installments." in joined
-    assert "No installment plan can finish by" in joined
+    assert "No monthly installment plan finishes by 2024-09-30" in joined
     assert "How many installments?" not in joined
-    blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
-    assert session.form["pay_by_date"] is None
-    assert "How many installments?" in blocks[-1]["text"]
-    blocks = session.handle("")  # default 3-month plan
-    assert "PAY IN 3 INSTALLMENTS" in blocks[-1]["text"]
+    assert any(block["kind"] == "report" for block in blocks)
 
 
 def test_deadline_question_answer_does_not_pre_filter_unchosen_installments(fake_dataset):
     # Deadline answered as a question with no method chosen: no
-    # "No installment plan can finish by..." message before asking.
+    # "No monthly installment plan finishes by..." message before asking.
+    # Once installments are chosen and nothing fits, the split is offered
+    # because fx_all3 accepts partial payment.
     _assistant, session = _session(fake_dataset, "fx_all3")
     session.handle("Laptop 12k")
     blocks = session.handle("2")  # within 14 days -> 2024-09-19
-    assert not any("No installment plan can finish by" in block["text"] for block in blocks)
+    assert not any("No monthly installment plan finishes by" in block["text"] for block in blocks)
     assert "How would you like to pay?" in blocks[-1]["text"]
-    blocks = session.handle("4")  # installments chosen -> conflict raised at once
-    assert any("No installment plan can finish by 2024-09-19" in block["text"] for block in blocks)
-    blocks = session.handle("1")  # remove the deadline -> the count still needs an answer
-    assert session.form["pay_by_date"] is None
-    assert "How many installments?" in blocks[-1]["text"]
-    blocks = session.handle("")
+    blocks = session.handle("4")  # installments chosen -> no plan fits -> split offer
+    assert any("No monthly installment plan finishes by 2024-09-19" in block["text"] for block in blocks)
+    assert "Would you like to split it into equal payments instead?" in blocks[-1]["text"]
+    blocks = session.handle("1")  # accept the split
+    assert "Optional split fee percentage?" in blocks[-1]["text"]
+    blocks = session.handle("")   # no fee
     assert any(block["kind"] == "report" for block in blocks)
+    assert "SPLIT INTO 2 EQUAL PAYMENTS" in blocks[-1]["text"]
 
 
 def test_earlier_disallowed_safe_options_wording(fake_dataset):
@@ -358,6 +352,7 @@ def test_method_question_lists_only_profile_methods(fake_dataset):
     assert "2 Pay in full today" in prompt
     assert "3 Pay part now and the rest later" in prompt
     assert "4 Pay in installments" in prompt
+    assert "5 Split into equal payments" in prompt
     # Single-method profiles never get the question; they get the rule instead.
     _assistant2, session2 = _session(fake_dataset, "fx_full")
     blocks2 = session2.handle("Laptop 12k")
@@ -451,10 +446,12 @@ def test_installment_chip_never_offers_the_verdict_count(fake_dataset):
 
 def test_installment_chip_never_offers_a_count_the_deadline_rules_out(fake_dataset):
     _assistant, session = _session(fake_dataset, "fx_inst12")
-    # 3 monthly payments finish 2024-11-04, in time; 6 finish 2025-02-02, late.
+    # 2 monthly payments finish 2024-10-05 and 3 finish 2024-11-04, both in
+    # time; 6 finish 2025-02-02, late. 3 is the verdict, so the chip offers 2.
     session.handle("Can I pay ₹50,000 in 3 installments by 2024-11-15?")
     labels = [label for label, _value in session.quick_replies()]
-    assert not any(label.startswith("Use ") for label in labels)  # 3 is the verdict, 6 misses
+    assert "Use 2 installments" in labels          # fits and is not the verdict count
+    assert not any(label.startswith("Use 6") for label in labels)  # 6 misses
     assert "Why not now?" in labels
 
 
@@ -473,33 +470,32 @@ def test_chip_sets_follow_the_profile(fake_dataset):
         "Pay half now", "Wait a month", "Use 3 installments", "Why not now?"]
 
 
-def test_count_question_states_the_deadline_note(fake_dataset):
+def test_count_question_lists_every_count_that_fits_the_deadline(fake_dataset):
     _assistant, session = _session(fake_dataset, "fx_inst12")
     session.handle("Laptop 12k")
     session.handle("4")                 # pick a date
     blocks = session.handle("2024-11-15")
     prompt = blocks[-1]
-    assert prompt["text"] == (f"How many installments? [1 3 months (default)] "
-                              f"Only 3 monthly payments finish by 2024-11-15 "
-                              f"(a 6-month plan would end {COUNT6_DATE}).")
-    assert prompt["data"]["question"] == (f"How many installments? Only 3 monthly payments finish by "
-                                          f"2024-11-15 (a 6-month plan would end {COUNT6_DATE}).")
+    # Counts 2 (2024-10-05) and 3 (2024-11-04) complete in time; 4 would not.
+    assert prompt["text"] == "How many installments? [1 2 months (default), 2 3 months]"
+    assert prompt["data"]["question"] == "How many installments?"
 
 
-def test_count_question_note_lists_every_eligible_count(fake_dataset):
+def test_count_question_lists_every_fitting_count_up_to_six(fake_dataset):
     _assistant, session = _session(fake_dataset, "fx_inst12")
     session.handle("Can I pay ₹50,000 in installments by 2025-02-15?")
     prompt = session.last_blocks[-1]["text"]
-    assert prompt == ("How many installments? [1 3 months (default), 2 6 months] "
-                      "Only 3 and 6 monthly payments finish by 2025-02-15 "
-                      "(a 12-month plan would end 2025-08-01).")
+    assert prompt == ("How many installments? [1 2 months (default), 2 3 months, 3 4 months, "
+                      "4 5 months, 5 6 months]")
 
 
-def test_count_question_has_no_note_when_the_deadline_admits_every_count(fake_dataset):
+def test_count_question_lists_every_count_when_the_deadline_admits_all(fake_dataset):
     _assistant, session = _session(fake_dataset, "fx_inst12")
     session.handle("Can I pay ₹50,000 in installments by 2025-09-15?")
     prompt = session.last_blocks[-1]["text"]
-    assert prompt == "How many installments? [1 3 months (default), 2 6 months, 3 12 months]"
+    assert prompt == ("How many installments? [1 2 months (default), 2 3 months, 3 4 months, 4 5 months, "
+                      "5 6 months, 6 7 months, 7 8 months, 8 9 months, 9 10 months, 10 11 months, "
+                      "11 12 months]")
 
 
 def test_why_and_why_not_now_are_clean_prose(fake_dataset):

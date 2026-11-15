@@ -19,7 +19,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "code"))
 from assistant import Assistant
-from terminal_flow import TerminalSession, emi, max_principal
+from terminal_flow import TerminalSession, _AFFORD_RE, emi, max_principal
 
 
 FAKE_USERS = (
@@ -145,12 +145,16 @@ def test_financing_snapshot_skips_an_impossible_amount(split_dataset):
     assert session.questions == []
 
 
-def test_financing_snapshot_continues_for_a_feasible_amount(split_dataset):
+def test_quick_answer_continues_for_a_feasible_amount(split_dataset):
+    # A feasible "how can I finance" ask opens with the QUICK ANSWER (full
+    # payment fits) and then continues with the usual intake questions.
     _assistant, session = _session(split_dataset, "fx_all3")
     blocks = session.handle("How can I finance a 60,000 laptop?")
-    assert blocks[0]["text"].startswith("FINANCING SNAPSHOT")
+    assert blocks[0]["text"].startswith("QUICK ANSWER")
+    assert "Yes — you can pay the full ₹60,000 today." in blocks[0]["text"]
     assert "Safe to pay today:" in blocks[0]["text"]
     assert "Based on:" in blocks[0]["text"]
+    assert "Tell me a deadline and I'll refine this." in "\n".join(b["text"] for b in blocks)
     assert session.phase == "intake"
     assert session.questions
     assert any(block["kind"] == "prompt" for block in blocks)
@@ -194,6 +198,89 @@ def test_loan_fit_and_non_fit_are_reported_from_monthly_room(split_dataset):
     loan = smaller._loan_section(result)
     assert "Loan type: personal loan." in loan
     assert "5 years:" in loan and "3 years:" in loan
+
+
+def test_afford_trigger_variants_and_non_triggers():
+    # The trigger covers afford/buy/get/pay-for/finance phrasings in any of
+    # the asked forms, while ordinary intake and follow-up lines stay outside
+    # its scope so they keep their existing behavior.
+    for line in ("Can I afford a phone worth 31k?", "Could I buy a laptop worth 12k?",
+                 "Can I get a phone worth 31k?", "Is it okay to buy a laptop worth 12k?",
+                 "Is it safe to pay for a 12k laptop?", "Should I buy a 31k phone?",
+                 "How should I pay for a 31k phone?", "Can I finance a 31k phone?",
+                 "How can I finance a 60,000 laptop?"):
+        assert _AFFORD_RE.search(line.lower()), line
+    for line in ("Can I pay ₹50,000 in 6 installments by 2024-09-20?",
+                 "Can I pay half now for a 12k laptop?", "Laptop 12k in 3 installments",
+                 "How much do you want to pay?"):
+        assert not _AFFORD_RE.search(line.lower()), line
+
+
+def test_should_i_buy_beyond_every_method_skips_to_snapshot(split_dataset):
+    # A "should I buy" phrasing on an impossible amount gets the snapshot and
+    # the verdict with no questionnaire, like the other trigger phrasings.
+    _assistant, session = _session(split_dataset, "fx_all3")
+    blocks = session.handle("Should I buy a car worth 1.8 Crore?")
+    assert blocks[0]["text"].startswith("FINANCING SNAPSHOT")
+    assert session.questions == [] and session.phase == "reported"
+    assert "NOT RECOMMENDED" in "\n".join(b["text"] for b in blocks)
+
+
+def test_quick_answer_partial_fit(split_dataset):
+    # Partial-only profile: paying in full is out of the profile, the
+    # half-now/half-later split is the fitting method.
+    _assistant, session = _session(split_dataset, "fx_partial")
+    blocks = session.handle("Can I afford a laptop that costs 12000?")
+    text = blocks[0]["text"]
+    assert text.startswith("QUICK ANSWER")
+    assert "Yes — partly today: pay ₹6,000.00 now and ₹6,000.00 on 15 Nov." in text
+    assert "Safe to pay today: ₹1,03,080.99." in text
+    assert "Both payments keep your balance above the minimum in the 90-day forecast." in text
+    assert "Tell me a deadline and I'll refine this." in "\n".join(b["text"] for b in blocks)
+    assert "deadline" in session.questions
+
+
+def test_loan_section_is_short_lines_without_urls(split_dataset):
+    _assistant, session = _session(split_dataset, "fx_all3")
+    session.handle("I want to buy a Bentley Continental GT worth 1.8 Crore. How can I finance this?")
+    report = session.last_blocks[-1]["text"]
+    loan = report.split("LOAN OPTION (illustrative)\n", 1)[1].split("╰", 1)[0]
+    for line in ("Loan type: car loan.",
+                 "Illustrative rate: 9% a year; this is not an offer.",
+                 "5 years: about ₹3,73,650.39 a month.",
+                 "Total interest over 5 years: ₹44,19,023.64.",
+                 "That payment does not fit your monthly room of ₹91,355.56.",
+                 "7 years: about ₹2,89,603.41 a month.",
+                 "Largest loan that fits over 7 years at 9%: ₹56,78,109.99.",
+                 "Typical car loan rates in India are about 7.4% to 11.5% a year (checked 15 Nov 2026).",
+                 "A loan this size isn't realistic.",
+                 "A loan of up to ₹56,78,109.99 would fit.",
+                 "This is an illustration, not a quote or financial advice.",
+                 "Lenders also check your credit score and income.",
+                 "Compare offers before applying.",
+                 "Based on: lender rate pages, checked 15 Nov 2026."):
+        assert line in loan, line
+    assert "http" not in report          # no URLs inline; they live in /sources and /export
+    checked, urls = session._loan_sources
+    assert checked == "15 Nov 2026"
+    assert len(urls) == 2 and all(url.startswith("https://") for url in urls)
+
+
+def test_sources_command_lists_lender_pages_and_export_carries_sources(split_dataset):
+    _assistant, session = _session(split_dataset, "fx_all3")
+    assert ("/sources" in session.handle("/help")[0]["text"])
+    assert ("No loan sources yet. A loan option appears when a purchase is beyond every "
+            "payment method." in session.handle("/sources")[0]["text"])
+    session.handle("I want to buy a Bentley Continental GT worth 1.8 Crore. How can I finance this?")
+    listed = session.handle("/sources")[0]["text"]
+    assert listed.startswith("Loan reference sources, checked 15 Nov 2026:")
+    assert "- https://www.indiatvnews.com/" in listed
+    assert "- https://tapzo.bankbazaar.com/" in listed
+    exported = session.handle("/export")[0]["text"]
+    assert "SOURCES\nLoan reference pages checked 15 Nov 2026:" in exported
+    assert "- https://www.indiatvnews.com/" in exported
+    session.handle("/reset")
+    assert "No loan sources yet." in session.handle("/sources")[0]["text"]
 
 
 def test_non_inr_has_explicit_no_reference_line(split_dataset):

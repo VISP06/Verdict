@@ -93,9 +93,13 @@ _FOLLOWUP_COUNT_PATTERNS = (
 )
 _PURCHASE_CUE_RE = re.compile(r"\b(?:pay|paying|afford|cost|costs|buy|buying|purchase)\b")
 _CURRENCY_RE = re.compile(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|rs\.?)\b|(?<!\w)R(?=\s*\d))", re.I)
-_FINANCING_RE = re.compile(
+_AFFORD_RE = re.compile(
     r"\bhow\s+(?:can|could|should|do)\s+(?:i|we)\s+(?:finance|afford|pay)\b"
-    r"|\bhow\s+to\s+(?:finance|afford|pay)\b", re.I)
+    r"|\bhow\s+to\s+(?:finance|afford|pay)\b"
+    r"|\bhow\s+should\s+(?:i|we)\s+pay\b"
+    r"|\b(?:can|could)\s+(?:i|we)\s+(?:afford|buy|get|pay\s+for|finance)\b"
+    r"|\bshould\s+(?:i|we)\s+(?:buy|finance)\b"
+    r"|\bis\s+it\s+(?:okay|ok|safe)\s+to\s+(?:buy|get|pay\s+for)\b", re.I)
 
 
 def emi(principal, annual_rate_pct, years):
@@ -244,6 +248,9 @@ class TerminalSession:
         self._fee_invalid = False
         self._conversion_note = None
         self._snapshot = None
+        self._quick_answer = False
+        self._method_plan_cache = {}
+        self._loan_sources = None
 
     @property
     def as_of_note(self):
@@ -453,12 +460,24 @@ class TerminalSession:
                     total += amount
         return total / 3.0
 
-    def _largest_full_payment(self, situation):
-        """Engine-bisected maximum for the full-payment method."""
-        payment = self._floor_cents(self._bisect_safe_payment(
-            lambda amount: {self.as_of_date: amount},
-            self._unsafe_payment_bound(situation)))
-        return payment
+    def _method_plan(self, method, situation):
+        """Largest amount a payment method keeps safe, engine-bisected and cached.
+
+        Used for affordability answers and for the loan gate, which must check
+        every method — even ones the profile excludes — before calling a
+        purchase unsupportable.  The full-payment figure is the engine
+        situation's capacity; part-now and installments are bisected.
+        """
+        cache = self._method_plan_cache
+        if method not in cache:
+            if method == "partial_payment":
+                cache[method] = self._largest_part_now_plan(situation)
+            elif method == "installments":
+                cache[method] = self._largest_installment_plan(situation)
+            else:
+                cache[method] = (float(situation["lowest_projected_balance"])
+                                 - float(situation["minimum_balance"]))
+        return cache[method]
 
     def _bisect_safe_payment(self, schedule_of_payment, hi):
         """Largest payment p whose dated schedule keeps every projected balance safe."""
@@ -510,34 +529,73 @@ class TerminalSession:
         per = self._floor_cents(self._bisect_safe_payment(
             lambda payment: {day: payment for day in dates},
             self._unsafe_payment_bound(situation)))
-        room = float(situation.get("monthly_income_total") or 0) - self._history_outflow_average()
-        total = max(0.0, min(per * cap, self._floor_cents(max(0.0, room) * cap)))
+        income = float(situation.get("monthly_income_total") or 0)
+        outflow = self._history_outflow_average()
+        if income > 0 or outflow > 0:
+            room = income - outflow
+            total = max(0.0, min(per * cap, self._floor_cents(max(0.0, room) * cap)))
+        else:
+            # No counted income and no recurring outflows for this as-of date:
+            # the monthly-room estimate carries no information, so the engine's
+            # 90-day balance check is the only bound.
+            total = per * cap
         return total, round(total / cap, 2), cap
 
-    def _build_financing_snapshot(self):
-        """FINANCING SNAPSHOT for 'how can I finance/afford/pay' questions.
-
-        Every figure comes from the engine (forecast and capacity) or the user's
-        own history; nothing is invented.
-        """
+    def _build_financing_data(self):
+        """Engine-backed figures behind affordability questions, inside one tool call."""
         with fp.session(self.session_id):
             with fp.tool_call("financing_snapshot", input={"user_id": self.user_id}) as tool:
-                snapshot = self._financing_snapshot_lines()
-                skip = float(self.form["amount"]) > snapshot["largest"]
-                tool.output = {"largest_feasible": snapshot["largest"],
+                data = self._financing_data()
+                skip = data.get("fit_method") is None
+                tool.output = {"largest_feasible": data.get("largest", 0.0),
                                "skip_questionnaire": skip}
-        return snapshot, skip
+        return data, skip
 
-    def _financing_snapshot_lines(self):
+    def _financing_data(self):
+        """Capacity and the cheapest fitting allowed method for this request.
+
+        Checks methods cheapest-first (full today, part-now, installments) and
+        stops at the first fit, so ordinary affordable questions pay for no
+        bisects at all.  When nothing fits, every allowed method's largest safe
+        amount is computed and the FINANCING SNAPSHOT lines are built.  Every
+        figure comes from the engine or the user's own history; nothing is
+        invented.
+        """
         home = self.form.get("currency", "INR")
         situation = self.assistant.situation()
         minimum = float(situation["minimum_balance"])
         capacity = self._floor_cents(max(0.0, float(situation["lowest_projected_balance"]) - minimum))
         amount = float(self.form["amount"])
+        allowed = self.assistant._profile_allowed_methods()
+        largests = {}
+        fit_method = None
+        if "full_payment" in allowed:
+            largests["full_payment"] = capacity
+            if amount <= capacity + 0.005:
+                fit_method = "full_payment"
+        if fit_method is None and "partial_payment" in allowed:
+            part = self._method_plan("partial_payment", situation)
+            largests["partial_payment"] = part
+            if part and amount <= float(part[0]) + 0.005:
+                fit_method = "partial_payment"
+        if fit_method is None and "installments" in allowed:
+            inst = self._method_plan("installments", situation)
+            largests["installments"] = inst
+            if inst and amount <= float(inst[0]) + 0.005:
+                fit_method = "installments"
+        data = {"home": home, "situation": situation, "capacity": capacity, "amount": amount,
+                "allowed": allowed, "largests": largests, "fit_method": fit_method}
+        if fit_method is not None:
+            return data
+        # Nothing fits: complete the remaining allowed methods and build the snapshot.
+        if "full_payment" in allowed:
+            largests["full_payment"] = capacity
+        for method in ("partial_payment", "installments"):
+            if method in allowed and method not in largests:
+                largests[method] = self._method_plan(method, situation)
         amount_text = self._prose(amount)
         item = str(self.form.get("item") or "")
         subject = f"The {item}" if item and item != "payment" and "?" not in item else "The request"
-        allowed = self.assistant._profile_allowed_methods()
         lines = []
         if capacity > 0:
             ratio = amount / capacity
@@ -555,40 +613,99 @@ class TerminalSession:
         largest = 0.0
         fit = "nothing with your current balance and history"
         if "full_payment" in allowed:
-            full_limit = self._largest_full_payment(situation)
+            full_limit = self._floor_cents(largests["full_payment"])
             lines.append(f"Pay in full: up to {self._money(full_limit, home)} today, in one payment.")
             if full_limit > largest:
                 largest, fit = full_limit, f"up to {self._money(full_limit, home)} paid in full today"
-        if "partial_payment" in allowed:
-            part = self._largest_part_now_plan(situation)
-            if part:
-                part_amount, part_day = part
-                lines.append(f"Part now, rest later: up to {self._money(part_amount, home)} if you pay "
-                             f"half now and half on {self._short(part_day)}.")
-                if part_amount > largest:
-                    largest, fit = part_amount, (f"up to {self._money(part_amount, home)} paying half now "
-                                                 f"and half on {self._short(part_day)}")
-        if "installments" in allowed:
-            plan = self._largest_installment_plan(situation)
-            if plan:
-                inst_amount, per, count = plan
-                lines.append(f"Installments: a purchase of up to {self._money(inst_amount, home)} over "
-                             f"{count} months — about {self._money(per, home)} a month.")
-                income = float(situation.get("monthly_income_total") or 0)
-                outflow = self._history_outflow_average()
-                room = income - outflow
+        part = largests.get("partial_payment")
+        if part:
+            part_amount, part_day = part
+            lines.append(f"Part now, rest later: up to {self._money(part_amount, home)} if you pay "
+                         f"half now and half on {self._short(part_day)}.")
+            if part_amount > largest:
+                largest, fit = part_amount, (f"up to {self._money(part_amount, home)} paying half now "
+                                             f"and half on {self._short(part_day)}")
+        inst = largests.get("installments")
+        if inst:
+            inst_amount, per, count = inst
+            lines.append(f"Installments: a purchase of up to {self._money(inst_amount, home)} over "
+                         f"{count} months — about {self._money(per, home)} a month.")
+            income = float(situation.get("monthly_income_total") or 0)
+            outflow = self._history_outflow_average()
+            room = income - outflow
+            if income > 0 or outflow > 0:
                 lines.append(f"That monthly payment stays within the estimated monthly room of "
                              f"{self._prose(max(0.0, room))} — counted income {self._prose(income)} minus "
                              f"average outflows {self._prose(outflow)} over your last 3 months of history. "
                              f"Payments in the next 90 days keep your balance above the minimum; "
                              f"beyond 90 days it is an estimate.")
-                if inst_amount > largest:
-                    largest, fit = inst_amount, (f"a purchase of up to {self._money(inst_amount, home)} "
-                                                 f"over {count} months")
+            else:
+                lines.append("Your history has no counted income or recurring outflows for this date, "
+                             "so the 90-day forecast is the real check; beyond 90 days it is an estimate.")
+            if inst_amount > largest:
+                largest, fit = inst_amount, (f"a purchase of up to {self._money(inst_amount, home)} "
+                                             f"over {count} months")
         lines.append(f"What would fit: {fit}.")
         lines.append("Based on: your profile, your bank history, your last 3 months of outflows "
                      "and the engine's 90-day forecast.")
-        return {"text": "FINANCING SNAPSHOT\n" + "\n".join(lines), "largest": largest, "fit": fit}
+        data["largest"] = largest
+        data["fit"] = fit
+        data["lines"] = lines
+        return data
+
+    def _financing_snapshot_text(self, data):
+        return "FINANCING SNAPSHOT\n" + "\n".join(data["lines"])
+
+    def _quick_answer_text(self, data):
+        """Two-to-four plain lines answering an affordability question up front.
+
+        The answer, the engine's safe-to-pay-today capacity, the allowed method
+        that fits and why, then one sources line; the usual intake questions
+        follow to refine the plan.
+        """
+        home = data["home"]
+        amount = data["amount"]
+        capacity = data["capacity"]
+        situation = data["situation"]
+        item = str(self.form.get("item") or "")
+        subject = f"the {item}" if item and item != "payment" and "?" not in item else "this purchase"
+        method = data["fit_method"]
+        lines = ["QUICK ANSWER"]
+        if method == "full_payment":
+            margin = self._floor_cents(float(situation["lowest_projected_balance"]) - amount
+                                       - float(situation["minimum_balance"]))
+            lines.append(f"Yes — you can pay the full {self._prose(amount)} today.")
+            lines.append(f"Safe to pay today: {self._money(capacity, home)}.")
+            lines.append(f"It keeps your lowest balance {self._margin_words(max(0.0, margin))} "
+                         f"through the next 90 days.")
+        elif method == "partial_payment":
+            part_total, part_day = data["largests"]["partial_payment"]
+            half = self._money(amount / 2.0, home)
+            del part_total
+            lines.append(f"Yes — partly today: pay {half} now and {half} on {self._short(part_day)}.")
+            lines.append(f"Safe to pay today: {self._money(capacity, home)}.")
+            lines.append("Both payments keep your balance above the minimum in the 90-day forecast.")
+        else:
+            inst_total, _inst_per, inst_count = data["largests"]["installments"]
+            per = self._money(round(amount / inst_count, 2), home)
+            income = float(situation.get("monthly_income_total") or 0)
+            outflow = self._history_outflow_average()
+            if income > 0 or outflow > 0:
+                room_text = (f"your estimated monthly room of "
+                             f"{self._prose(max(0.0, income - outflow))}")
+            else:
+                room_text = ("the 90-day forecast, with no counted income or outflows in your "
+                             "history for this date")
+            if amount <= capacity + 0.005:
+                lines.append(f"Yes — you can afford {subject}.")
+            else:
+                lines.append("Not all today, but installments would cover it.")
+            lines.append(f"Safe to pay today: {self._money(capacity, home)}.")
+            lines.append(f"It fits as up to {inst_count} installments of about {per} a month, within "
+                         f"the 90-day forecast and {room_text}.")
+        lines.append("Based on: your profile, your bank history, your last 3 months of outflows "
+                     "and the engine's 90-day forecast.")
+        return "\n".join(lines)
 
     def _loan_monthly_room(self, situation):
         """The same counted-income-minus-recurring-outflows room as the snapshot."""
@@ -606,46 +723,124 @@ class TerminalSession:
         return reference, currency_data[loan_key]
 
     def _loan_section(self, result):
-        """Illustrative loan comparison appended only to unsafe reports."""
+        """Illustrative loan comparison, only for purchases beyond every method.
+
+        Short separate lines, no run-on paragraph, no URLs inline; the source
+        links stay in the downloaded report and the /sources command.
+        """
         reference, loan = self._loan_reference_for_request()
         currency = str(self.form.get("currency") or "").upper()
-        lines = ["LOAN OPTION (illustrative)"]
+        header = "LOAN OPTION (illustrative)"
         if loan is None:
-            lines.append(f"No loan reference data for {currency} yet.")
-            return "\n".join(lines)
+            return f"{header}\nNo loan reference data for {currency} yet."
 
         situation = result["situation"]
         principal = float(self.form.get("amount") or 0)
         room = self._loan_monthly_room(situation)
         rate = float(loan["illustrative_rate_pct"])
         tenures = [int(years) for years in loan["tenures_years"]]
-        lines.append(f"Loan type: {loan['label']}.")
-        lines.append(f"Illustrative rate: {rate:g}% a year; this is not an offer.")
+        lines = [header,
+                 f"Loan type: {loan['label']}.",
+                 f"Illustrative rate: {rate:g}% a year; this is not an offer."]
         for years in tenures:
             monthly = emi(principal, rate, years)
             total_interest = monthly * years * 12 - principal
-            fits = "fits" if monthly <= room + 1e-9 else "does not fit"
-            lines.append(f"{years} years: {self._money(monthly)} a month; total interest "
-                         f"{self._money(total_interest)}; {fits} your monthly room of {self._money(room)}.")
-
+            fits = monthly <= room + 1e-9
+            lines.append(f"{years} years: about {self._money(monthly)} a month.")
+            lines.append(f"Total interest over {years} years: {self._money(total_interest)}.")
+            lines.append(f"That payment {'fits' if fits else 'does not fit'} "
+                         f"your monthly room of {self._money(room)}.")
         longest = max(tenures)
         longest_payment = emi(principal, rate, longest)
         fitting = max_principal(room, rate, longest)
-        lines.append(f"Largest loan that fits over {longest} years at {rate:g}%: "
-                     f"{self._money(fitting)}.")
         low, high = loan["rate_range_pct"]
         as_of = reference["as_of"]
         date_text = dt.date.fromisoformat(as_of).strftime("%-d %b %Y")
+        lines.append(f"Largest loan that fits over {longest} years at {rate:g}%: "
+                     f"{self._money(fitting)}.")
         lines.append(f"Typical {loan['label'].replace('-', ' ')} rates in India are about "
                      f"{low:g}% to {high:g}% a year (checked {date_text}).")
         if longest_payment > room + 1e-9:
             lines.append(f"Even over {longest} years the payment would be {self._money(longest_payment)} "
-                         f"against your monthly room of {self._money(room)}, so a loan this size isn't "
-                         f"realistic. A loan of up to {self._money(fitting)} would fit.")
-        lines.append("This is an illustration, not a quote or financial advice. Lenders also check your "
-                     "credit score and income. Compare offers before applying.")
-        lines.append("Based on: reference data checked " + date_text + ": " + "; ".join(loan["sources"]))
+                         f"against your monthly room of {self._money(room)}.")
+            lines.append("A loan this size isn't realistic.")
+            lines.append(f"A loan of up to {self._money(fitting)} would fit.")
+        lines.append("This is an illustration, not a quote or financial advice.")
+        lines.append("Lenders also check your credit score and income.")
+        lines.append("Compare offers before applying.")
+        lines.append("Based on: lender rate pages, checked " + date_text + ".")
+        self._loan_sources = (date_text, list(loan["sources"]))
         return "\n".join(lines)
+
+    def _purchase_unsupportable(self, result):
+        """True when no payment method at all keeps this amount safe.
+
+        The loan section is evidence for purchases beyond what the user's
+        finances can support, so every method counts — even ones the profile
+        excludes.  A NOT RECOMMENDED verdict caused only by a deadline or by
+        the profile excluding a method that would work never gets one.
+        """
+        options = result.get("ranked_options", [])
+        if any(option.get("safe") for option in options):
+            return False
+        full = next((option for option in options if option["type"] == "pay_in_full_now"), None)
+        if full is None or full.get("safe"):
+            return False
+        amount = float(self.form.get("amount") or 0)
+        situation = result["situation"]
+        if amount <= self._floor_cents(self._method_plan("full_payment", situation)) + 0.005:
+            return False
+        for method in ("partial_payment", "installments"):
+            plan = self._method_plan(method, situation)
+            if plan and amount <= float(plan[0]) + 0.005:
+                return False
+        return True
+
+    def _accepted_methods_words(self, allowed):
+        """Payment-method names for 'your profile only accepts ...' lines."""
+        words = {"full_payment": "paying in full", "partial_payment": "partial payments",
+                 "installments": "installments"}
+        named = [words[method] for method in ("full_payment", "partial_payment", "installments")
+                 if method in allowed]
+        if not named:
+            return "waiting"
+        if len(named) == 1:
+            return named[0]
+        return ", ".join(named[:-1]) + " and " + named[-1]
+
+    def _blocked_but_affordable_lines(self, result):
+        """Honest lines when the money is fine but the profile or deadline blocks the verdict.
+
+        Returns the three plain sentences (money is fine, why it is blocked,
+        what would unlock it) or an empty list when the verdict is a real
+        affordability miss.
+        """
+        full = next((option for option in result.get("ranked_options", [])
+                     if option["type"] == "pay_in_full_now"), None)
+        if not (full and full.get("safe")):
+            return []
+        deadline_blocked = self._unmet_deadline(result)
+        profile_blocked = "full_payment" not in self.assistant._profile_allowed_methods()
+        if not (deadline_blocked or profile_blocked):
+            return []
+        minimum = float(result["situation"]["minimum_balance"])
+        margin = float(full["lowest_projected_balance"]) - minimum
+        reasons = []
+        if profile_blocked:
+            reasons.append(f"your profile only accepts "
+                           f"{self._accepted_methods_words(self.assistant._profile_allowed_methods())}")
+        if deadline_blocked:
+            reasons.append(f"none can finish by {self.form.get('pay_by_date')}")
+        unlocks = []
+        if deadline_blocked:
+            shortest = installment_completion_date(self.as_of_date, min(self.installment_counts))
+            unlocks.append(f"a deadline on or after {shortest}")
+        if profile_blocked:
+            unlocks.append("accepting paying in full")
+        return [f"Your money is fine: paying {self._prose(self.form['amount'])} today would keep you "
+                f"{self._margin_words(max(0.0, margin))}.",
+                f"It is blocked because {' and '.join(reasons)}.",
+                "What would unlock it: " + " or ".join(unlocks) + "."]
 
     def _has_installment_conflict(self, deadline):
         count = self.form.get("installment_count") if (self.form.get("allow_installments") and getattr(self, "_installment_count_given", False)) else None
@@ -823,18 +1018,28 @@ class TerminalSession:
         self._normalize_currency()
         lowered = line.lower()
         self._snapshot = None
-        if _FINANCING_RE.search(lowered):
-            # Financing questions open with an engine-backed snapshot, before
-            # any intake question; an impossible amount skips the questionnaire.
-            snapshot, skip = self._build_financing_snapshot()
-            self._snapshot = snapshot
-            self._block("text", snapshot["text"])
+        self._quick_answer = False
+        if _AFFORD_RE.search(lowered):
+            # Affordability and financing questions answer first, before any
+            # intake question: a QUICK ANSWER when some allowed method fits,
+            # otherwise the FINANCING SNAPSHOT and the verdict, with the
+            # questionnaire skipped for amounts nothing can pay for.
+            data, skip = self._build_financing_data()
             if skip:
+                snapshot = {"text": self._financing_snapshot_text(data),
+                            "largest": data["largest"], "fit": data["fit"]}
+                self._snapshot = snapshot
                 self._snapshot["skip"] = True
+                self._block("text", snapshot["text"])
                 self.questions = []
                 self.phase = "intake"
                 self.question_index = 0
                 return self._make_report()
+            quick_text = self._quick_answer_text(data)
+            self._snapshot = {"text": quick_text, "quick": True,
+                              "largest": data.get("largest", 0.0), "fit": data.get("fit", "")}
+            self._quick_answer = True
+            self._block("text", quick_text)
         self.questions = []
         self._installment_count_given = False
         if not self._parse_deadline(line):
@@ -908,6 +1113,8 @@ class TerminalSession:
         self._acknowledge(lowered)
         if statement:
             self._block("text", statement)
+        if self._quick_answer and "deadline" in self.questions:
+            self._block("text", "Tell me a deadline and I'll refine this.")
         if self.form.get("allow_installments") and self.form.get("pay_by_date") and self._has_installment_conflict(self.form["pay_by_date"]):
             deadline = self.form["pay_by_date"]
             self.questions = [q for q in self.questions if q != "deadline"]
@@ -1681,6 +1888,10 @@ class TerminalSession:
                 lines.append(f"Paying {first_amount} now and {rest_amount} on {self._short(rest_date)} would "
                              f"take you to {self._prose(low_value)} on {self._short(low_day)}, "
                              f"{margin_text}, so splitting it works.")
+        # (d2) When the money itself is fine and the verdict is blocked by the
+        #      profile or the deadline, say that plainly here too.
+        if chosen is None or self._unmet_deadline(result):
+            lines.extend(self._blocked_but_affordable_lines(result))
         # (e) Pending bank items in plain words.
         pending = situation.get("pending_items_considered_or_ignored") or {}
         ignored = list(pending.get("ignored") or [])
@@ -1946,10 +2157,14 @@ class TerminalSession:
         alts = []
 
         if unmet_deadline:
-            alts.append(
-                f"No payment method you would consider completes by {self.form['pay_by_date']}; "
-                f"the shortest allowed plan ends on {shortest_plan}, after the deadline.")
-            alts.append(f"Remove the deadline or pick a date on or after {shortest_plan} to see a recommended plan.")
+            blocked = self._blocked_but_affordable_lines(result)
+            if blocked:
+                alts.extend(blocked)
+            else:
+                alts.append(
+                    f"No payment method you would consider completes by {self.form['pay_by_date']}; "
+                    f"the shortest allowed plan ends on {shortest_plan}, after the deadline.")
+                alts.append(f"Remove the deadline or pick a date on or after {shortest_plan} to see a recommended plan.")
             if other_safe_names:
                 alts.append(f"Safe alternative options: {', '.join(other_safe_names)}.")
         elif verdict.startswith("PAY IN FULL TODAY"):
@@ -1984,7 +2199,7 @@ class TerminalSession:
                 alts.append(f"Pick a later deadline (up to {horizon}) or pay the safe amount today instead.")
             full_now = next((x for x in options if x.get("safe") and x["type"] == "pay_in_full_now"), None)
             if full_now and "full_payment" not in self.assistant._profile_allowed_methods():
-                alts.append("Paying in full today would be safe, but it isn't among the payment methods you accept.")
+                alts.extend(self._blocked_but_affordable_lines(result))
             if safe_today > 0:
                 alts.append(f"Amount safe to pay today: {self._money(safe_today, currency)} (downsized purchase).")
             if earliest and earliest > self.as_of_date:
@@ -2092,7 +2307,11 @@ class TerminalSession:
         end_date = dates[-1] if dates else (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
         start_balance = vals[0] if vals else situation["current_balance"]
         end_balance = vals[-1] if vals else situation["current_balance"]
-        loan = self._loan_section(result) if verdict.startswith("NOT RECOMMENDED") else None
+        loan = None
+        if verdict.startswith("NOT RECOMMENDED") and self._purchase_unsupportable(result):
+            loan = self._loan_section(result)
+        else:
+            self._loan_sources = None
         loan_text = f"\n\n{loan}" if loan else ""
         return (f"╭─ {verdict} ─╮\nWHY\n{why}\n\nNUMBERS\n90-day balance: {spark}\nMinimum-balance level: {self._money(minimum,currency)}\n{start_date} {self._money(start_balance,currency)} → {end_date} {self._money(end_balance,currency)}\n\nOPTIONS\n" + "\n".join(rows) + "\n\nALTERNATIVES\n" + "\n".join("• "+s for s in alts) + "\n\nNEXT STEPS\n" + "\n".join("• "+s for s in steps) + loan_text + "\n╰" + "─" * max(10, len(verdict) + 4) + "╯")
 
@@ -2137,7 +2356,7 @@ class TerminalSession:
                             "start_balance": values[0] if values else situation["current_balance"],
                             "end_balance": values[-1] if values else situation["current_balance"]},
                 "options": options, "alternatives": alternatives, "next_steps": next_steps,
-                "loan": loan_text}
+                "loan": loan_text, "loan_sources": getattr(self, "_loan_sources", None)}
 
     def _handle_account_inquiry(self, text):
         low = text.lower()
@@ -2216,7 +2435,7 @@ class TerminalSession:
         text = str(line or "").strip()
         command = text.lower()
         if command.startswith("/help"):
-            self._block("text", "Start with an amount and optional currency. Intake asks only unanswered questions; Enter accepts defaults and /skip uses defaults. Commands: /user <id>, /users [currency], /date YYYY-MM-DD, /situation, /why, /reset, /export, /help, /skip. Use /export after a report to get plain text.")
+            self._block("text", "Start with an amount and optional currency. Intake asks only unanswered questions; Enter accepts defaults and /skip uses defaults. Commands: /user <id>, /users [currency], /date YYYY-MM-DD, /situation, /why, /sources, /reset, /export, /help, /skip. Use /export after a report to get plain text.")
         elif command == "/why":
             self._block("text", self._why_text())
         elif command == "/users" or command.startswith("/users "):
@@ -2229,7 +2448,13 @@ class TerminalSession:
             self._block("text", "Accounts" + (f" in {requested}" if requested else "") + ":\n" + ("\n".join(lines) or "No matching accounts."))
         elif command == "/export":
             if self.report:
-                self._block("export", self.render_report(self.report))
+                text = self.render_report(self.report)
+                sources = getattr(self, "_loan_sources", None)
+                if sources:
+                    checked, urls = sources
+                    text += ("\n\nSOURCES\nLoan reference pages checked " + checked + ":\n"
+                             + "\n".join(f"- {url}" for url in urls))
+                self._block("export", text)
             else:
                 self._block("text", "No report to export yet. Ask an amount first.")
         elif command == "/situation":
@@ -2246,7 +2471,17 @@ class TerminalSession:
             self.phase = "ready"; self.form = {}; self.questions = []; self.report = None
             self._conversion_note = None
             self._snapshot = None
+            self._loan_sources = None
             self._block("text", "Session reset. What are you considering?")
+        elif command == "/sources":
+            sources = getattr(self, "_loan_sources", None)
+            if not sources:
+                self._block("text", "No loan sources yet. A loan option appears when a purchase is "
+                                    "beyond every payment method.")
+            else:
+                checked, urls = sources
+                self._block("text", "Loan reference sources, checked " + checked + ":\n"
+                            + "\n".join(f"- {url}" for url in urls))
         elif command == "/user": self._block("text", "Usage: /user <id>")
         elif command.startswith("/user "):
             new_user = text.split(maxsplit=1)[1]
@@ -2316,7 +2551,10 @@ class TerminalSession:
                 self.question_index = 0
                 self.invalid_attempts = 0
                 self.report = None
-                return self._start(text)
+                # Fall through to `return self.last_blocks` so any blocks the
+                # new request emitted first (a QUICK ANSWER or FINANCING
+                # SNAPSHOT) reach the caller with the report.
+                self._start(text)
             else:
                 previous = self._comparison(self.report) if self.report else None
                 outcome = self._apply_followup(text)

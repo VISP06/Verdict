@@ -429,6 +429,96 @@ def test_reported_phase_fresh_refrigerator_request():
     assert session.form["amount"] == 25000.0
 
 
+# --- Affordability questions answer first (QUICK ANSWER), then intake ---
+
+def test_user_07_quick_answer_for_a_feasible_phone():
+    session = TerminalSession("user_07", "2024-09-05")  # installments-only profile
+    blocks = session.handle("Can I afford a phone worth 31k?")
+    quick = blocks[0]["text"]
+    assert quick.startswith("QUICK ANSWER")
+    assert "Yes — you can afford the phone." in quick
+    assert "Safe to pay today: ₹1,03,080.99." in quick
+    assert ("It fits as up to 12 installments of about ₹2,583.33 a month, within the 90-day "
+            "forecast and your estimated monthly room of ₹91,356.") in quick
+    assert quick.endswith("Based on: your profile, your bank history, your last 3 months of "
+                          "outflows and the engine's 90-day forecast.")
+    # The usual intake continues after the answer.
+    assert blocks[1]["text"] == "Got it: ₹31,000.00 · phone · installments · no deadline given yet."
+    assert "Your profile only allows installments." in "\n".join(b["text"] for b in blocks)
+    assert "Tell me a deadline and I'll refine this." in "\n".join(b["text"] for b in blocks)
+    assert blocks[-1]["kind"] == "prompt" and "When do you need to pay?" in blocks[-1]["text"]
+
+
+def test_user_20_quick_answer_installments_cover_a_bigger_phone():
+    session = TerminalSession("user_20", "2026-02-07")
+    blocks = session.handle("Can I afford a phone worth 31k?")
+    quick = blocks[0]["text"]
+    assert quick.startswith("QUICK ANSWER")
+    assert "Not all today, but installments would cover it." in quick
+    assert "Safe to pay today: ₹15,078.52." in quick
+    assert ("It fits as up to 11 installments of about ₹2,818.18 a month, within the 90-day "
+            "forecast and your estimated monthly room of ₹71,505.") in quick
+
+
+def test_user_20_quick_answer_partial_fit_for_a_smaller_phone():
+    # ₹20,000 is beyond the safe today-capacity (₹15,078.52) but within the
+    # half-now/half-later split, so the quick answer names that method.
+    session = TerminalSession("user_20", "2026-02-07")
+    blocks = session.handle("Can I afford a phone worth 20k?")
+    quick = blocks[0]["text"]
+    assert quick.startswith("QUICK ANSWER")
+    assert "Yes — partly today: pay ₹10,000.00 now and ₹10,000.00 on 15 Apr." in quick
+    assert "Safe to pay today: ₹15,078.52." in quick
+    assert "Both payments keep your balance above the minimum in the 90-day forecast." in quick
+
+
+def test_user_07_unaffordable_car_skips_intake_to_snapshot_and_loan():
+    session = TerminalSession("user_07", "2024-09-05")
+    blocks = session.handle("Can I afford a car worth 5 crore?")
+    assert blocks[0]["text"].startswith("FINANCING SNAPSHOT")
+    assert "Safe to pay today: ₹1,03,080.99." in blocks[0]["text"]
+    assert "What would fit:" in blocks[0]["text"]
+    assert session.questions == [] and session.phase == "reported"
+    report = blocks[-1]["text"]
+    assert "NOT RECOMMENDED" in report
+    assert "Loan type: car loan." in report      # beyond every method -> loan option
+
+
+def test_deadline_blocked_verdict_is_honest_and_has_no_loan_option():
+    # ₹12,000 keeps user_07 far above the minimum, but no installment plan can
+    # finish within 14 days: the verdict says the money is fine and the
+    # deadline blocks it, and no loan section appears.
+    session = TerminalSession("user_07", "2024-09-05")
+    session.handle("Can I afford a laptop that costs 12k?")
+    blocks = session.handle("2")  # within 14 days -> no eligible plan -> report
+    report = blocks[-1]["text"]
+    assert "NOT RECOMMENDED: no allowed plan completes by 2024-09-19" in report
+    honest = ("Your money is fine: paying ₹12,000 today would keep you ₹91,081 above your minimum.\n"
+              "It is blocked because your profile only accepts installments and none can finish "
+              "by 2024-09-19.\n"
+              "What would unlock it: a deadline on or after 2024-11-04 or accepting paying in full.")
+    why = report.split("WHY\n", 1)[1].split("\n\nNUMBERS", 1)[0]
+    alts = report.split("ALTERNATIVES\n", 1)[1].split("\n\nNEXT STEPS\n")[0]
+    assert honest in why
+    for line in honest.split("\n"):
+        assert f"• {line}" in alts
+    assert "LOAN OPTION" not in report
+
+
+def test_loan_option_appears_for_a_genuinely_unsupportable_bentley():
+    session = TerminalSession("user_07", "2024-09-05")
+    blocks = session.handle("I want to buy a Bentley Continental GT worth 1.8 Crore. How can I finance this?")
+    report = blocks[-1]["text"]
+    assert "NOT RECOMMENDED" in report
+    assert "LOAN OPTION (illustrative)" in report
+    assert "Loan type: car loan." in report
+    assert "Based on: lender rate pages, checked 15 Nov 2026." in report
+    assert "http" not in report                  # URLs stay in /sources and the export
+    listed = session.handle("/sources")[0]["text"]
+    assert listed.startswith("Loan reference sources, checked 15 Nov 2026:")
+    assert "- https://" in listed
+
+
 def test_reported_phase_direct_account_questions():
     session = TerminalSession("user_07", "2025-11-04")
     session.handle("Laptop 12k no deadline just advise")
@@ -558,7 +648,7 @@ def test_intake_explicit_partial_skips_installments():
 
 
 def test_method_choice_controls_follow_up_questions():
-    session, _ = start("Can I afford a laptop that costs 80000?")  # user_05 allows all methods
+    session, _ = start("Can I afford a laptop that costs 40000?")  # user_05 allows all methods
     session.handle("")  # no deadline -> method question
     blocks = session.handle("3")  # pay part now -> amount question, never a count question
     assert "How much do you want to pay now?" in blocks[-1]["text"]
@@ -568,12 +658,27 @@ def test_method_choice_controls_follow_up_questions():
     assert session.form["allow_partial"] is True
     assert session.form["allow_installments"] is False
 
-    session, _ = start("Can I afford a laptop that costs 80000?")
+    session, _ = start("Can I afford a laptop that costs 40000?")
     session.handle("")
     blocks = session.handle("2")  # pay in full today -> straight to the report
     assert any(block["kind"] == "report" for block in blocks)
     assert "installments" not in session.questions
     assert session.form["allow_installments"] is False
+
+
+def test_impossible_afford_amount_skips_intake_with_snapshot():
+    # user_05's balance tops out at ZAR 28,145.68 today, ZAR 43,697.66 with a
+    # split and less with installments, so R80,000 fits no allowed method: the
+    # questionnaire is skipped and the snapshot plus verdict answer at once.
+    session, blocks = start("Can I afford a laptop that costs 80000?")
+    assert blocks[0]["text"].startswith("FINANCING SNAPSHOT")
+    assert "Safe to pay today: ZAR 28,145.68." in blocks[0]["text"]
+    assert "What would fit:" in blocks[0]["text"]
+    assert session.questions == [] and session.phase == "reported"
+    report = blocks[-1]["text"]
+    assert any(block["kind"] == "report" for block in blocks)
+    assert "NOT RECOMMENDED" in report
+    assert "When do you need" not in report and "How would you like to pay?" not in report
 
 
 def test_plain_request_still_asks_full_intake():

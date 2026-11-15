@@ -207,13 +207,16 @@ def test_skipping_the_conflict_gives_not_recommended_deadline_verdict(fake_datas
     report_text = blocks[-1]["text"]
     assert "NOT RECOMMENDED: no allowed plan completes by 2024-09-20" in report_text
     assert "PAY IN 6 INSTALLMENTS" not in report_text
-    assert "No payment method you would consider completes by 2024-09-20" in report_text
-    assert f"the shortest allowed plan ends on {COUNT3_DATE}" in report_text
-    # The profile is installments-only, so pay-in-full is never offered as the
-    # fallback in the alternatives (the OPTIONS table still lists the evaluated
-    # scenarios as evidence).
+    # The money is fine (pay-in-full would stay above the minimum) and the
+    # verdict is blocked only by the profile and the deadline, so the
+    # alternatives say that plainly instead of pretending nothing fits.
     alts_section = report_text.split("ALTERNATIVES\n", 1)[1].split("\n\nNEXT STEPS\n")[0]
-    assert "pay in full" not in alts_section
+    assert "Your money is fine: paying ₹50,000 today would keep you ₹" in alts_section
+    assert "above your minimum." in alts_section
+    assert ("It is blocked because your profile only accepts installments "
+            "and none can finish by 2024-09-20.") in alts_section
+    assert (f"What would unlock it: a deadline on or after {COUNT3_DATE} "
+            "or accepting paying in full.") in alts_section
     installments_row = next(row for row in session.report_data(session.report)["options"]
                             if row["name"] == "installments")
     assert installments_row["meets_deadline"] == "no"
@@ -302,7 +305,9 @@ def test_item_extraction_drops_relative_pronoun(fake_dataset):
     assert TerminalSession._request_item("Can I afford a laptop that costs 80000? ") == "laptop"
     _assistant, session = _session(fake_dataset)
     blocks = session.handle("Can I afford a laptop that costs 80000?")
-    assert "Got it: ₹80,000.00 · laptop · installments · no deadline given yet." == blocks[0]["text"]
+    # Affordability questions answer first: the QUICK ANSWER opens, then the ack.
+    assert blocks[0]["text"].startswith("QUICK ANSWER")
+    assert "Got it: ₹80,000.00 · laptop · installments · no deadline given yet." == blocks[1]["text"]
 
 
 def test_profile_gates_questions_chips_and_neutral_followups(fake_dataset):

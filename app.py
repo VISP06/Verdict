@@ -74,7 +74,7 @@ def report_html(block):
         pieces.extend(f'<p>• {esc(line.lstrip("• "))}</p>' for line in data.get(key, []))
     if data.get("loan"):
         pieces.append('<div class="section-title">LOAN OPTION (illustrative)</div>')
-        pieces.append(f'<p>{esc(data["loan"])}</p>')
+        pieces.extend(f'<p>{esc(line)}</p>' for line in str(data["loan"]).splitlines())
     return "".join(pieces) + "</div>"
 
 
@@ -129,7 +129,7 @@ for block_index, block in enumerate(output):
             output = list(output) + [{"kind": "user_input", "plain_text": line}] + blocks
             st.session_state.terminal_output = output
             st.rerun()
-        st.markdown('<div class="commands">/help　/users　/user ID　/date YYYY-MM-DD　/situation　/why　/reset　/export</div>', unsafe_allow_html=True)
+        st.markdown('<div class="commands">/help　/users　/user ID　/date YYYY-MM-DD　/situation　/why　/sources　/reset　/export</div>', unsafe_allow_html=True)
     elif kind == "report":
         st.markdown(report_html(block), unsafe_allow_html=True)
         if block_index == latest_report_index:
@@ -139,6 +139,11 @@ for block_index, block in enumerate(output):
                 if col.button(label, key=f"followup_{block_index}_{label}"):
                     st.session_state.pending_line = value
             report_text = block.get("plain_text", "")
+            sources = (block.get("data", {}) or {}).get("loan_sources")
+            if sources:
+                checked, urls = sources
+                report_text += ("\n\nSOURCES\nLoan reference pages checked " + checked + ":\n"
+                                + "\n".join(f"- {url}" for url in urls))
             cols[-1].download_button("Download report", report_text, file_name="glacier-report.txt",
                                      mime="text/plain", key=f"download_report_{block_index}")
     elif kind == "export":

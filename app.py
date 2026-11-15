@@ -29,7 +29,7 @@ html,body,[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,#
 .welcome,.block{background:#0D2233;border:1px solid #1F4660;border-radius:8px;padding:1rem 1.15rem;margin:.7rem 0;color:#D8F3FF;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
 .welcome{border-color:#24516a}.welcome p{margin:.1rem 0 .8rem}.commands{font-size:.76rem;color:#7FA6BD;margin-top:.5rem}
 .user-input{color:#D8F3FF}.user-input .prefix{color:#5CE1E6}.prompt-question{color:#8CC8FF;font-weight:600}.option-chip{display:inline-block;color:#8CC8FF;border:1px solid #31536b;border-radius:4px;padding:.08rem .4rem;margin:.45rem .35rem 0 0;font-size:.78rem}.option-chip.default{border-color:#5CE1E6;color:#5CE1E6}
-.report{border:1px solid #1F4660;border-left:4px solid var(--status);border-radius:8px;background:#0D2233;padding:1rem 1.2rem;margin:.7rem 0;color:#D8F3FF;line-height:1.55;overflow-wrap:anywhere}.verdict{font-size:1.35rem;font-weight:700;color:var(--status);margin-bottom:.9rem}.section-title{color:#5CE1E6;font-size:.78rem;letter-spacing:.16em;font-weight:700;margin:1rem 0 .35rem}.report p{margin:.25rem 0}.spark{color:#5CE1E6;letter-spacing:.12em;font-size:1.1rem}.range{color:#7FA6BD;font-size:.78rem}.options-table{border-collapse:collapse;width:100%;font-family:inherit;font-size:.78rem}.options-table th{text-align:left;color:#7FA6BD;border-bottom:1px solid #31536b;padding:.35rem}.options-table td{padding:.35rem;border-bottom:1px solid #1a394e;vertical-align:top}.options-table thead th:nth-child(5){white-space:nowrap;min-width:9ch}.options-table thead th:nth-child(6){white-space:nowrap;min-width:6ch}.safe{color:#7CF5C0}.unsafe{color:#FF7A90}.unsafe-note{color:#FF7A90;padding:.1rem 0 .35rem 1rem;font-size:.76rem}.error{color:#FF7A90}
+.report{border:1px solid #1F4660;border-left:4px solid var(--status);border-radius:8px;background:#0D2233;padding:1rem 1.2rem;margin:.7rem 0;color:#D8F3FF;line-height:1.55;overflow-wrap:anywhere}.verdict{font-size:1.35rem;font-weight:700;color:var(--status);margin-bottom:.9rem}.section-title{color:#5CE1E6;font-size:.78rem;letter-spacing:.16em;font-weight:700;margin:1rem 0 .35rem}.report p{margin:.25rem 0}.spark{color:#5CE1E6;letter-spacing:.12em;font-size:1.1rem}.range{color:#7FA6BD;font-size:.78rem}.options-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}.options-table{border-collapse:collapse;min-width:max-content;font-family:inherit;font-size:.78rem}.options-table th{text-align:left;color:#7FA6BD;border-bottom:1px solid #31536b;padding:.35rem;white-space:nowrap}.options-table td{padding:.35rem;border-bottom:1px solid #1a394e;vertical-align:top;white-space:nowrap}.options-table thead th:nth-child(5){white-space:nowrap;min-width:9ch}.options-table thead th:nth-child(6){white-space:nowrap;min-width:6ch}.safe{color:#7CF5C0}.unsafe{color:#FF7A90}.unsafe-note{color:#FF7A90;padding:.1rem 0 .35rem 1rem;font-size:.76rem}.error{color:#FF7A90}
 div[data-testid="stChatInput"]{border:1px solid #1F4660;background:#0D2233;position:relative;padding-left:5.7rem}div[data-testid="stChatInput"]:before{content:'glacier ❯';position:absolute;left:1rem;top:.85rem;color:#5CE1E6;font-family:'JetBrains Mono',monospace;font-size:.85rem;pointer-events:none}div[data-testid="stChatInput"] textarea{font-family:'JetBrains Mono',monospace;color:#D8F3FF;caret-color:#5CE1E6;background:transparent}div[data-testid="stChatInput"] button{background:transparent!important;border:0!important;color:#5CE1E6!important;box-shadow:none!important}
 div.stButton>button{background:#10283a;color:#8CC8FF;border:1px solid #31536b;border-radius:999px;font-family:inherit;font-size:.78rem;padding:.25rem .65rem}div.stButton>button:hover{border-color:#5CE1E6;color:#5CE1E6}
 [class*="st-key-mcq_"]{max-width:540px;margin:.15rem 0 .6rem}[class*="st-key-mcq_"] button{justify-content:flex-start;text-align:left;border-radius:8px;background:#0D2233;border:1px solid #1F4660;color:#D8F3FF;padding:.55rem .9rem;font-size:.86rem}[class*="st-key-mcq_"] button:hover{border-color:#5CE1E6;background:#10304a;color:#D8F3FF}[class*="st-key-mcq_"] button:focus-visible{outline:2px solid #5CE1E6}[class*="st-key-mcq_"] button p{display:flex;gap:.55rem;align-items:center;margin:0}[class*="st-key-mcq_"] button[kind="primary"]{border-color:#2c6f7a}
@@ -60,15 +60,16 @@ def report_html(block):
     pieces += [f'<div class="section-title">NUMBERS</div><div class="spark">{esc(spark)}</div>',
                f'<p>Minimum balance: {esc(fmt_money(numbers.get("minimum", 0), currency))}</p>',
                f'<div class="range">{esc(range_text)}</div>', '<div class="section-title">OPTIONS</div>',
-               '<table class="options-table"><thead><tr><th>OPTION</th><th>WHEN</th><th>COST</th><th>LOWEST</th><th>DEADLINE</th><th>SAFE</th></tr></thead><tbody>']
+               '<div class="options-scroll"><table class="options-table"><thead><tr><th>OPTION</th><th>WHEN</th><th>COST</th><th>LOWEST</th><th>DEADLINE</th><th>SAFE</th></tr></thead><tbody>']
     for option in data.get("options", []):
         mark = '<span class="safe">✓</span>' if option.get("safe") else '<span class="unsafe">✗</span>'
         pieces += [f'<tr><td>{esc(option.get("name", ""))}</td><td>{esc(option.get("when", ""))}</td>'
                    f'<td>{esc(option.get("cost", ""))}</td><td>{esc(option.get("lowest", ""))}</td>'
                    f'<td>{esc(option.get("meets_deadline", "n/a"))}</td><td>{mark}</td></tr>']
         if option.get("note"):
-            pieces.append(f'</tbody></table><div class="unsafe-note">{esc(option["note"])}</div><table class="options-table"><tbody>')
-    pieces += ['</tbody></table>']
+            pieces.append(f'</tbody></table></div><div class="unsafe-note">{esc(option["note"])}</div>'
+                          f'<div class="options-scroll"><table class="options-table"><tbody>')
+    pieces += ['</tbody></table></div>']
     for title, key in (("ALTERNATIVES", "alternatives"), ("NEXT STEPS", "next_steps")):
         pieces.append(f'<div class="section-title">{title}</div>')
         pieces.extend(f'<p>• {esc(line.lstrip("• "))}</p>' for line in data.get(key, []))
@@ -151,25 +152,47 @@ for block_index, block in enumerate(output):
                            mime="text/plain", key=f"export_report_{block_index}")
     elif kind == "prompt":
         data = block.get("data", {})
-        active = block_index == latest_prompt_index
+        # A prompt stays interactive only while it is still awaiting its
+        # answer (no user input was submitted after it).  Answered prompts
+        # render read-only with the chosen value marked, and every widget is
+        # keyed on the prompt's unique id so a re-run can never resubmit an
+        # older prompt's value.
+        chosen = next((item.get("plain_text", "") for item in output[block_index + 1:]
+                       if item.get("kind") == "user_input"), None)
+        awaiting = chosen is None
+        active = block_index == latest_prompt_index and awaiting
+        pid = str(data.get("id") or f"p{block_index}")
         st.markdown(f'<div class="block"><div class="prompt-question">{esc(data.get("question", block["plain_text"]))}</div></div>', unsafe_allow_html=True)
         options = data.get("options", [])
-        if active and options:
-            with st.container(key=f"mcq_{block_index}"):
+        if options:
+            with st.container(key=f"mcq_{pid}"):
                 for option_index, option in enumerate(options):
                     label = option.get("label", "")
-                    if option.get("default"):
+                    default = option.get("default")
+                    if default:
                         label += "  :gray[default]"
-                    icon = ":material/radio_button_checked:" if option.get("default") else ":material/radio_button_unchecked:"
-                    if st.button(label, icon=icon, key=f"prompt_{block_index}_{option_index}", use_container_width=True):
-                        st.session_state.pending_line = str(option.get("key", ""))
-                        st.session_state.pending_label = option.get("label", "")
+                    unchecked = ":material/radio_button_checked:" if default else ":material/radio_button_unchecked:"
+                    widget_key = f"prompt_{pid}_{option_index}"
+                    if active:
+                        if st.button(label, icon=unchecked, key=widget_key, use_container_width=True):
+                            st.session_state.pending_line = str(option.get("key", ""))
+                            st.session_state.pending_label = option.get("label", "")
+                    else:
+                        picked = chosen is not None and chosen.strip() in {str(option.get("key", "")), option.get("label", "")}
+                        st.button(label, icon=":material/radio_button_checked:" if picked else unchecked,
+                                  key=widget_key + "_done", disabled=True, use_container_width=True)
         picker = data.get("picker")
-        if active and picker:
+        if picker:
             low = dt.date.fromisoformat(picker["min"]); high = max(low, dt.date.fromisoformat(picker["max"]))
-            with st.container(key=f"mcq_date_{block_index}"):
-                picked = st.date_input(picker.get("label", "Choose a date"), value=low, min_value=low, max_value=high, key=f"deadline_date_{block_index}")
-                if st.button("Confirm date", icon=":material/check:", key=f"confirm_date_{block_index}"):
+            with st.container(key=f"mcq_date_{pid}"):
+                picker_value = low
+                if chosen:
+                    try: picker_value = dt.date.fromisoformat(chosen.strip())
+                    except ValueError: pass
+                picked = st.date_input(picker.get("label", "Choose a date"), value=picker_value,
+                                       min_value=low, max_value=high, key=f"deadline_date_{pid}",
+                                       disabled=not active)
+                if active and st.button("Confirm date", icon=":material/check:", key=f"confirm_date_{pid}"):
                     st.session_state.pending_line = picked.isoformat()
                     st.session_state.pending_label = picked.isoformat()
     elif kind == "user_input":

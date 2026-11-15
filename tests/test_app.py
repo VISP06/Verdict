@@ -80,7 +80,8 @@ def test_date_picker_confirm_path(monkeypatch):
     _offline(monkeypatch)
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
     at.chat_input[0].set_value("Laptop costs 12k").run()
-    next(button for button in at.button if button.label.startswith("Pick a date")).click().run()
+    # The deadline prompt now carries the calendar directly; no "Pick a date…"
+    # intermediate question any more.
     assert len(at.date_input) == 1
     at.date_input[0].set_value(dt.date(2024, 11, 20))
     next(button for button in at.button if button.label == "Confirm date").click().run()
@@ -139,3 +140,49 @@ def test_full_conversation_with_clicks_only_and_choice_echoed(monkeypatch):
     assert "PAY IN 3 INSTALLMENTS" in html
     assert "No deadline" in html and "3 monthly payments" in html
     assert "\u276f 1<" not in html
+
+
+def test_answered_prompts_render_disabled_and_keep_their_choice(monkeypatch):
+    _offline(monkeypatch)
+    at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=60).run()
+    at.chat_input[0].set_value("Laptop costs 12k").run()
+    live = [b.key for b in at.button if b.key and b.key.startswith("prompt_")]
+    assert live and not any(k.endswith("_done") for k in live)
+    first_id = {k[len("prompt_"):].rsplit("_", 1)[0] for k in live}
+    assert len(first_id) == 1               # one prompt -> one id across its widgets
+    _click(at, "No deadline")
+    keys = [b.key for b in at.button if b.key and b.key.startswith("prompt_")]
+    done = [k for k in keys if k.endswith("_done")]
+    live = [k for k in keys if not k.endswith("_done")]
+    assert done and live
+    # The answered prompt keeps its widgets read-only under the same id...
+    assert {k[len("prompt_"):-len("_done")].rsplit("_", 1)[0] for k in done} == first_id
+    # ...and the newest prompt is interactive under a fresh unique id, so a
+    # re-run can never resubmit an older prompt's value.
+    assert {k[len("prompt_"):].rsplit("_", 1)[0] for k in live}.isdisjoint(first_id)
+
+
+def test_stale_bare_numbers_after_a_report_leave_the_report_intact(monkeypatch):
+    _offline(monkeypatch)
+    at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=60).run()
+    at.chat_input[0].set_value("Laptop costs 12k").run()
+    _click(at, "No deadline")
+    _click(at, "3 monthly payments")
+    md = "\n".join(x.value for x in at.markdown)
+    assert "PAY IN 3 INSTALLMENTS" in md       # the report is on the table
+    for click in ("1", "2", "1", "2"):
+        at.chat_input[0].set_value(click).run()
+        md = "\n".join(x.value for x in at.markdown)
+        assert "That choice is no longer active. Ask a new question or use one of the suggestions." in md
+        assert "PAY IN 3 INSTALLMENTS" in md   # ...and stays there
+        assert "Got it: ₹1.00" not in md       # no phantom new request
+
+
+def test_options_table_scrolls_horizontally_on_narrow_screens(monkeypatch):
+    _offline(monkeypatch)
+    at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
+    at.chat_input[0].set_value("Laptop costs 500k no deadline just advise").run()
+    md = "\n".join(x.value for x in at.markdown)
+    assert '<div class="options-scroll"><table class="options-table">' in md
+    assert "white-space:nowrap" in md          # headers never wrap
+    assert "overflow-x:auto" in md

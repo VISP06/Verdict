@@ -100,6 +100,11 @@ _AFFORD_RE = re.compile(
     r"|\b(?:can|could)\s+(?:i|we)\s+(?:afford|buy|get|pay\s+for|finance)\b"
     r"|\bshould\s+(?:i|we)\s+(?:buy|finance)\b"
     r"|\bis\s+it\s+(?:okay|ok|safe)\s+to\s+(?:buy|get|pay\s+for)\b", re.I)
+# A line that is nothing but a number is an option click (or a typed amount
+# while the amount question is pending), never a fresh request of its own.
+_BARE_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+_STALE_CHOICE = ("That choice is no longer active. Ask a new question "
+                 "or use one of the suggestions.")
 
 
 def emi(principal, annual_rate_pct, years):
@@ -251,6 +256,8 @@ class TerminalSession:
         self._quick_answer = False
         self._method_plan_cache = {}
         self._loan_sources = None
+        self._awaiting_amount = False
+        self._prompt_seq = 0
 
     @property
     def as_of_note(self):
@@ -875,7 +882,13 @@ class TerminalSession:
         return None
 
     def _block(self, kind, text, data=None):
-        block = {"kind": kind, "text": str(text), "plain_text": str(text), "data": data or {}}
+        data = dict(data or {})
+        if kind == "prompt":
+            # A unique id per prompt instance: the browser keys its widgets on
+            # it, so a re-run can never resubmit an older prompt's value.
+            self._prompt_seq += 1
+            data.setdefault("id", f"{self.session_id}-p{self._prompt_seq}")
+        block = {"kind": kind, "text": str(text), "plain_text": str(text), "data": data}
         self.last_blocks.append(block)
         return block
 
@@ -937,7 +950,7 @@ class TerminalSession:
             return self._block("prompt", text, {"question": "Is there a fee for the split?",
                                                 "options": [{"key": key, "label": label, "default": default} for key, label, default in choices]})
         options = {
-            "deadline": "When do you need to pay? [1 none (default), 2 within 14 days, 3 end of this month, 4 type YYYY-MM-DD]",
+            "deadline": "When do you need to pay? [1 none (default), 2 within 14 days, 3 end of this month, or type/pick a date]",
             "installments": f"How many installments? [{self._installment_options_text()}]",
             "fee": "Optional installment fee percentage? [Enter for 0%]",
         }
@@ -945,8 +958,19 @@ class TerminalSession:
         clean_questions = {"deadline": "When do you need to pay?",
                            "installments": "How many installments?",
                            "fee": "Is there a fee for installments?"}
-        if question == "deadline": choices = [("1", "No deadline", True), ("2", "Within 14 days", False), ("3", "By the end of this month", False), ("4", "Pick a date…", False)]
-        elif question == "installments":
+        if question == "deadline":
+            # One-step date choice: the calendar ships with the deadline
+            # question itself (as its last option), so there is no separate
+            # "Pick a date…" question any more.
+            choices = [("1", "No deadline", True), ("2", "Within 14 days", False),
+                       ("3", "By the end of this month", False)]
+            picker = {"label": "Pick a date", "min": self.as_of_date,
+                      "max": (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()}
+            return self._block("prompt", text, {"question": clean_questions.get(question, text),
+                                                "options": [{"key": k, "label": label, "default": default}
+                                                            for k, label, default in choices],
+                                                "picker": picker})
+        if question == "installments":
             counts = self._eligible_installment_counts() or list(self.installment_counts)
             choices = [(str(idx + 1), f"{count} monthly payments", idx == 0) for idx, count in enumerate(counts)]
         else: choices = [(str(value), "No fee" if value == 0 else f"{value}% fee", value == 0) for value in (0, 1, 2, 5)]
@@ -1004,6 +1028,9 @@ class TerminalSession:
             if re.search(r"(?<!\w)-\s*\d", line):
                 return [self._block("error", "Amounts must be positive; please enter an amount above zero.")]
             text = "What amount are you considering?"
+            # While this prompt is pending a bare number is the typed amount;
+            # everywhere else a bare number is a stale option click.
+            self._awaiting_amount = True
             return [self._block("prompt", text, {"question": text, "options": []})]
         self.request_text = line
         home = str(self.assistant.engine.get_user_home_currency(self.user_id))
@@ -1141,9 +1168,13 @@ class TerminalSession:
     def _request_item(text):
         """Extract the purchase name from common amount-and-deadline phrasing."""
         value = str(text or "").strip()
+        # Connectives that glue the item to its amount ("a phone which is 30k")
+        # end the item name; everything from the first one on is dropped.
+        terminators = (r"which\s+is|that\s+is|that'?s|which|that|worth|costing|costs?|"
+                       r"priced\s+at|around|about|of|for|at")
         match = re.search(
             r"\b(?:buy|purchase)\s+(?:a|an|the)?\s*(.+?)\s+"
-            r"(?:worth|costing|costs?|priced at)\s+(?:₹|\$|€|R\s*)?"
+            r"(?:" + terminators + r")\s+(?:₹|\$|€|R\s*)?"
             r"[\d,.]+\s*(?:k|thousand|lakh|lakhs|lac|lacs|crore|crores)?",
             value, re.I,
         )
@@ -1152,11 +1183,19 @@ class TerminalSession:
         else:
             item = re.sub(r"\b(?:can i|can we|should i|should we)\b", "", value, flags=re.I)
             item = re.sub(r"\b(?:buy|purchase|afford|finance|financing|pay for|how|do)\b", "", item, flags=re.I)
-            item = re.split(r"\b(?:worth|costing|costs?|by|i will|i'll|without|no installments?|that)\b", item, maxsplit=1, flags=re.I)[0]
+            item = re.split(r"\b(?:" + terminators + r"|by|i will|i'll|without|no installments?)\b",
+                            item, maxsplit=1, flags=re.I)[0]
             item = re.sub(r"(?:₹|\$|€|\b(?:INR|USD|EUR|ZAR|IDR|Rs\.?)\b)\s*", "", item, flags=re.I)
             item = re.sub(r"\b\d[\d,.]*(?:\s*(?:k|thousand|lakh|lakhs|lac|lacs|crore|crores))?\b", "", item, flags=re.I)
             item = re.sub(r"\b(?:no deadline|no due date|just advise|in full|pay in full|pay half now|today)\b", "", item, flags=re.I)
         item = re.sub(r"\b(?:a|an|the)\b", "", item, flags=re.I)
+        # Drop connectives left dangling at the end ("a phone at about 30k").
+        for _ in range(3):
+            trimmed = re.sub(r"\s*\b(?:at|for|is|of|which|that|around|about|worth|costing|priced)\s*$",
+                             "", item, flags=re.I)
+            if trimmed == item:
+                break
+            item = trimmed
         return re.sub(r"\s+", " ", item).strip(" ?.!,$") .lower() or "payment"
 
     def _parse_deadline(self, text):
@@ -1246,12 +1285,13 @@ class TerminalSession:
         conflict_choices = {"1": None}
         if "full_payment" in allowed:
             conflict_choices["2"] = "full"
-        choices = {"deadline": {"1": None, "2": "14", "3": "month", "4": "date"},
+        typed_deadline_date = key == "deadline" and value not in {"", "1", "2", "3"}
+        choices = {"deadline": {"1": None, "2": "14", "3": "month"},
                    "deadline_conflict": conflict_choices, "method": method_choices,
                    "installments": installment_choices,
                    "split_offer": {"1": "yes", "2": "no"}}
-        is_date = key == "date" or (key == "deadline_conflict" and value not in {"", "1"}
-                                    and not (value == "2" and "2" in conflict_choices))
+        is_date = key == "date" or typed_deadline_date or (key == "deadline_conflict" and value not in {"", "1"}
+                                     and not (value == "2" and "2" in conflict_choices))
         fee_number = re.fullmatch(r"\d+(?:\.\d+)?", value)
         valid = value == "" or (key in choices and value in choices[key]) \
             or (key == "fee" and bool(fee_number) and 0 <= float(value) <= 30) \
@@ -1266,7 +1306,7 @@ class TerminalSession:
                 partial_now = parse_amount(value)[0]
             valid = partial_now is not None and 0 < float(partial_now) <= float(self.form["amount"])
         relative_value = re.fullmatch(r"in\s+(\d+)\s+(days?|weeks?)", value, re.I)
-        if relative_value and key in {"date", "deadline_conflict"}:
+        if relative_value and key in {"date", "deadline_conflict", "deadline"}:
             n = int(relative_value.group(1)); unit = relative_value.group(2).lower()
             parsed_relative = dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=n * (7 if unit.startswith("week") else 1))
             value = parsed_relative.isoformat()
@@ -1285,7 +1325,7 @@ class TerminalSession:
         if not valid:
             self.invalid_attempts += 1
             if self.invalid_attempts == 1:
-                if key in {"date", "deadline_conflict"}:
+                if key in {"date", "deadline_conflict", "deadline"}:
                     self._block("text", f"Date must be on or after {self.as_of_date} and within the 90-day forecast.")
                 elif key == "partial_amount":
                     self._block("text", f"Enter an amount up to {self._fmt(self.form['amount'])}, or press Enter for the safest amount.")
@@ -1307,16 +1347,24 @@ class TerminalSession:
                     self.form["installments_declined"] = True
                 else:
                     self.form["pay_by_date"] = dt.date.fromisoformat(value).isoformat()
+            elif value in {"", "1"}:
+                self.form["pay_by_date"] = None
             elif value == "2":
                 self.form["pay_by_date"] = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=14)).isoformat()
             elif value == "3":
                 d = dt.date.fromisoformat(self.as_of_date); n = d.replace(day=28) + dt.timedelta(days=4)
                 self.form["pay_by_date"] = (n.replace(day=1) - dt.timedelta(days=1)).isoformat()
-            elif value == "4":
-                self.questions[self.question_index] = "date"
-                return [self._prompt()]
             else:
-                self.form["pay_by_date"] = None
+                # The merged deadline question: a typed or calendar-picked date
+                # answers it directly; the old "Pick a date…" step is gone.
+                parsed = dt.date.fromisoformat(value)
+                horizon = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
+                if parsed.isoformat() > horizon:
+                    # Never silently drop a too-late deadline: say the cap and re-ask.
+                    self._block("text", f"Deadlines can be at most 90 days ahead (until {horizon}). "
+                                        f"Pick a date up to then, or choose no deadline for longer installment plans.")
+                    return [self._prompt()]
+                self.form["pay_by_date"] = parsed.isoformat()
         elif key == "date":
             parsed = dt.date.fromisoformat(value) if value else None
             horizon = (dt.date.fromisoformat(self.as_of_date) + dt.timedelta(days=90)).isoformat()
@@ -2434,6 +2482,11 @@ class TerminalSession:
         self.last_blocks = []
         text = str(line or "").strip()
         command = text.lower()
+        # True only while the "What amount are you considering?" prompt from
+        # the previous turn is still unanswered; a bare number is then the
+        # typed amount, everywhere else it is a stale option click.
+        awaiting_amount = getattr(self, "_awaiting_amount", False)
+        self._awaiting_amount = False
         if command.startswith("/help"):
             self._block("text", "Start with an amount and optional currency. Intake asks only unanswered questions; Enter accepts defaults and /skip uses defaults. Commands: /user <id>, /users [currency], /date YYYY-MM-DD, /situation, /why, /sources, /reset, /export, /help, /skip. Use /export after a report to get plain text.")
         elif command == "/why":
@@ -2529,10 +2582,15 @@ class TerminalSession:
                     or self.questions[self.question_index] not in {"fee", "split_fee"}) and re.search(r"(?<!\w)-\s*\d", text):
                 self._block("error", "Amounts must be positive; please enter an amount above zero.")
             elif new_amount is not None and not is_answer:
-                self._block("text", "Starting a new request and resetting the current intake.")
-                self.phase = "ready"
-                self.form = {}; self.questions = []; self.question_index = 0
-                self._start(text)
+                if _BARE_NUMBER_RE.fullmatch(text) and not awaiting_amount:
+                    # A bare number mid-question is a stale option click, not a
+                    # new request amount; the pending question stays open.
+                    self._block("text", _STALE_CHOICE)
+                else:
+                    self._block("text", "Starting a new request and resetting the current intake.")
+                    self.phase = "ready"
+                    self.form = {}; self.questions = []; self.question_index = 0
+                    self._start(text)
             else:
                 self._accept_answer(text)
         elif self.phase == "reported":
@@ -2544,6 +2602,10 @@ class TerminalSession:
                 self._block("text", why)
             elif (account_inquiry := self._handle_account_inquiry(text)) is not None:
                 return account_inquiry
+            elif _BARE_NUMBER_RE.fullmatch(text) and not awaiting_amount:
+                # A bare number after a report is a re-click of an old option,
+                # not a new request amount; the report stays on the table.
+                self._block("text", _STALE_CHOICE)
             elif self._is_new_request_in_reported_phase(text):
                 self.phase = "ready"
                 self.form = {}
@@ -2586,7 +2648,13 @@ class TerminalSession:
                 else:
                     self._block("text", "Type a request or a follow-up.")
         else:
-            self._start(text)
+            if _BARE_NUMBER_RE.fullmatch(text) and not awaiting_amount:
+                # A bare number with nothing pending is a re-click of an old
+                # option; only the pending "What amount are you considering?"
+                # prompt turns a bare number into an amount.
+                self._block("text", _STALE_CHOICE)
+            else:
+                self._start(text)
         return self.last_blocks
 
     def _comparison(self, result, previous=None):

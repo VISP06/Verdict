@@ -1,3 +1,4 @@
+import datetime as dt
 import os
 import sys
 
@@ -5,7 +6,7 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "code"))
-from terminal_flow import TerminalSession, fmt_money, parse_amount
+from terminal_flow import TerminalSession, _STALE_CHOICE, fmt_money, parse_amount
 from plan_dates import installment_completion_date
 
 
@@ -347,7 +348,6 @@ def test_ambiguous_and_negative_amount_messages_and_large_amount_warning():
 @pytest.mark.parametrize("answer", ["2025-11-03", "in 2 days", "in 2 weeks", "2026-02-10"])
 def test_typed_deadline_validation_table(answer):
     session, _ = start("Laptop 12k")
-    session.handle("4")
     blocks = session.handle(answer)
     if answer == "2025-11-03":
         assert session.form.get("pay_by_date") is None
@@ -359,7 +359,7 @@ def test_typed_deadline_validation_table(answer):
         assert any("Deadlines can be at most 90 days ahead (until 2026-02-02)" in block["text"]
                    and "no deadline for longer installment plans" in block["text"]
                    for block in session.last_blocks)
-        assert "Type a date" in blocks[-1]["text"]
+        assert "When do you need to pay?" in blocks[-1]["text"]
     else:
         assert session.form.get("pay_by_date") in {"2025-11-06", "2025-11-18"}
 
@@ -782,8 +782,7 @@ def test_unsafe_note_never_claims_a_zero_shortfall():
 def test_typed_deadline_too_short_for_any_plan_reports_the_miss():
     session = TerminalSession("user_07", "2025-11-04")
     blocks = session.handle("Laptop 12k")
-    session.handle("4")                   # pick a date
-    blocks = session.handle("2025-11-04")  # deadline = today
+    blocks = session.handle("2025-11-04")  # deadline = today, typed at the deadline question
     joined = " ".join(block["text"] for block in blocks)
     assert "No monthly installment plan finishes by 2025-11-04" in joined
     assert "How many installments?" not in joined
@@ -845,3 +844,121 @@ def test_explicit_installments_above_cap_as_followup_keeps_the_capped_verdict():
                for block in blocks)
     assert any(block["kind"] == "report" for block in blocks)
     assert blocks[-1]["text"].split("\n", 1)[0] == "╭─ PAY IN 12 INSTALLMENTS ─╮"
+
+
+# --- Item extraction: connectives between item and amount are stripped ---
+
+@pytest.mark.parametrize(("text", "item"), [
+    ("Can I afford a phone which is 30k?", "phone"),
+    ("a laptop that is 12k", "laptop"),
+    ("a phone that's 30k", "phone"),
+    ("a phone costing 30k", "phone"),
+    ("a phone priced at 30k", "phone"),
+    ("a phone worth 30k", "phone"),
+    ("a phone around 30k", "phone"),
+    ("a phone about 30k", "phone"),
+    ("a phone of 30k", "phone"),
+    ("a phone for 30k", "phone"),
+    ("a phone at 30k", "phone"),
+    ("a phone at about 30k", "phone"),
+    ("Buy a phone which is 30k", "phone"),
+    ("Can I afford a laptop that costs 80000?", "laptop"),
+])
+def test_request_item_strips_amount_connectives(text, item):
+    assert TerminalSession._request_item(text) == item
+
+
+def test_quick_answer_uses_the_stripped_item():
+    session = TerminalSession("user_07", "2024-09-05")
+    blocks = session.handle("Can I afford a phone which is 30k?")
+    assert session.form.get("item") == "phone"
+    assert "Yes — you can afford the phone." in blocks[0]["text"]
+
+
+# --- Stale option clicks: a bare number is an amount only while asked ---
+
+def test_repeated_stale_clicks_after_a_report_change_nothing():
+    session = TerminalSession("user_07", "2024-09-05")  # installments-only profile
+    session.handle("Can I afford a phone which is 30k?")
+    session.handle("")   # deadline: no deadline
+    session.handle("")   # count: default -> report
+    report = session.report
+    assert report is not None
+    for click in ("1", "2", "1", "2"):
+        blocks = session.handle(click)
+        assert blocks[0]["text"] == _STALE_CHOICE
+        assert [block["kind"] for block in blocks] == ["text"]
+        assert session.report is report           # the same report stays on the table
+        assert session.form.get("amount") == 30000.0
+        assert session.phase == "reported"
+
+
+def test_fresh_bare_number_with_nothing_pending_is_stale():
+    session = TerminalSession("user_05", "2025-11-04")
+    blocks = session.handle("1")
+    assert blocks[0]["text"] == _STALE_CHOICE
+    assert session.phase == "ready" and not session.form
+
+
+def test_bare_number_answers_only_the_pending_amount_prompt():
+    session = TerminalSession("user_05", "2025-11-04")
+    blocks = session.handle("1")
+    assert blocks[0]["text"] == _STALE_CHOICE     # nothing pending yet
+    session.handle("phone")                       # no amount -> the amount prompt
+    blocks = session.handle("1")                  # now the bare number IS the amount
+    assert "Got it" in blocks[0]["text"]
+    assert session.form.get("amount") == 1.0
+
+
+def test_bare_number_mid_question_is_stale_and_leaves_the_question_open():
+    session, _ = start("Laptop 12k")              # deadline question pending
+    for click in ("12", "99"):                    # repeated bare numbers, no new request
+        blocks = session.handle(click)
+        assert blocks[0]["text"] == _STALE_CHOICE
+        assert session.questions[session.question_index] == "deadline"
+        assert session.form.get("amount") == 12000.0
+    blocks = session.handle("2")                  # real option keys still answer it
+    assert session.form.get("pay_by_date") == "2025-11-18"
+
+
+def test_non_bare_amount_mid_question_still_restarts_the_intake():
+    session, _ = start("Laptop 12k")
+    blocks = session.handle("actually 20k")
+    assert blocks[0]["text"] == "Starting a new request and resetting the current intake."
+    assert session.form.get("amount") == 20000.0
+
+
+# --- One-step deadline question: the calendar ships with the prompt ---
+
+def test_deadline_prompt_offers_the_calendar_directly():
+    session, blocks = start("Laptop 12k")
+    prompt = blocks[-1]
+    assert prompt["kind"] == "prompt"
+    assert [option["label"] for option in prompt["data"]["options"]] == [
+        "No deadline", "Within 14 days", "By the end of this month"]
+    picker = prompt["data"]["picker"]
+    assert picker["min"] == session.as_of_date
+    assert picker["max"] == (dt.date.fromisoformat(session.as_of_date)
+                             + dt.timedelta(days=90)).isoformat()
+    assert "type/pick a date" in prompt["text"]
+    # The two-step "Pick a date…" question is gone.
+    assert not any("Pick a date…" in block["text"] for block in session.last_blocks)
+
+
+def test_deadline_still_accepts_a_typed_date_directly():
+    session, _ = start("Laptop 12k")
+    blocks = session.handle("2025-11-20")
+    assert session.form.get("pay_by_date") == "2025-11-20"
+    # Intake continues with the next question; no separate "Pick a date…" step.
+    assert "How would you like to pay?" in blocks[-1]["text"]
+
+
+def test_each_prompt_instance_gets_a_fresh_unique_id():
+    session, blocks = start("Laptop 12k")
+    first = blocks[-1]["data"]["id"]
+    blocks = session.handle("")
+    second = blocks[-1]["data"]["id"]
+    assert first.endswith("-p1") and second.endswith("-p2") and first != second
+    session.handle("x")                            # invalid answer -> re-prompt
+    third = session.last_blocks[-1]["data"]["id"]
+    assert third.endswith("-p3") and third not in {first, second}

@@ -478,8 +478,7 @@ def test_chip_sets_follow_the_profile(fake_dataset):
 def test_count_question_lists_every_count_that_fits_the_deadline(fake_dataset):
     _assistant, session = _session(fake_dataset, "fx_inst12")
     session.handle("Laptop 12k")
-    session.handle("4")                 # pick a date
-    blocks = session.handle("2024-11-15")
+    blocks = session.handle("2024-11-15")  # deadline typed at the deadline question
     prompt = blocks[-1]
     # Counts 2 (2024-10-05) and 3 (2024-11-04) complete in time; 4 would not.
     assert prompt["text"] == "How many installments? [1 2 months (default), 2 3 months]"

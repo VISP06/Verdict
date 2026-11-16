@@ -11,7 +11,8 @@ import streamlit as st
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "code"))
 from assistant import Assistant
-from terminal_flow import BANNER, TerminalSession, fmt_money
+from terminal_flow import (BANNER, TerminalSession, fmt_money, profile_summary_text,
+                           resolve_user_id, user_picker_options, user_switch_arg)
 
 APP_VERSION = "glacier-terminal-v4"
 DATASET = os.path.join(ROOT, "dataset")
@@ -26,6 +27,7 @@ html,body,[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,#
 .block-container{max-width:980px;padding:1rem 1.2rem 5rem}
 .status{position:sticky;top:0;z-index:5;background:#08141Fee;border-bottom:1px solid #1F4660;padding:.65rem 0;margin-bottom:1.1rem;display:flex;gap:.5rem;flex-wrap:wrap}
 .chip{border:1px solid #1F4660;border-radius:999px;padding:.22rem .58rem;font-size:.78rem;color:#5CE1E6}.chip .label{color:#7FA6BD}
+.profile{color:#7FA6BD;font-size:.8rem;margin:.15rem 0 .55rem}
 .welcome,.block{background:#0D2233;border:1px solid #1F4660;border-radius:8px;padding:1rem 1.15rem;margin:.7rem 0;color:#D8F3FF;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
 .welcome{border-color:#24516a}.welcome p{margin:.1rem 0 .8rem}.commands{font-size:.76rem;color:#7FA6BD;margin-top:.5rem}
 .user-input{color:#D8F3FF}.user-input .prefix{color:#5CE1E6}.prompt-question{color:#8CC8FF;font-weight:600}.option-chip{display:inline-block;color:#8CC8FF;border:1px solid #31536b;border-radius:4px;padding:.08rem .4rem;margin:.45rem .35rem 0 0;font-size:.78rem}.option-chip.default{border-color:#5CE1E6;color:#5CE1E6}
@@ -80,8 +82,34 @@ def report_html(block):
 
 
 user_ids = profiles.user_id.astype(str).tolist()
+picker = user_picker_options(profiles)
+picker_ids = [uid for uid, _label in picker]
+picker_labels = dict(picker)
+profile_by_user = {str(row.user_id): row for _, row in profiles.iterrows()}
+
 user_id = st.session_state.get("terminal_user", "user_07" if "user_07" in user_ids else user_ids[0])
+# Account switcher.  A picker change is committed to session state before the
+# run starts, so it is adopted first; the picker is written back (pre-widget,
+# which overrides any pending picker event) only when the active user was
+# changed another way, e.g. by a /user command line.
+picker_now = st.session_state.get("user_switcher")
+picker_seen = st.session_state.get("user_switcher_seen")
+switched = picker_now is not None and picker_now != picker_seen and picker_now != user_id
+if switched:
+    user_id = picker_now
+    st.session_state.terminal_user = user_id
+    st.session_state.terminal_date = None
+elif picker_now != user_id and user_id in picker_ids:
+    st.session_state.user_switcher = user_id
+st.session_state.user_switcher_seen = user_id
 date_key = st.session_state.get("terminal_date")
+
+st.selectbox("Account", options=picker_ids, format_func=picker_labels.get,
+             index=picker_ids.index(user_id) if user_id in picker_ids else 0, key="user_switcher")
+profile_row = profile_by_user.get(user_id)
+if profile_row is not None:
+    st.markdown(f'<div class="profile">{esc(profile_summary_text(profile_row))}</div>', unsafe_allow_html=True)
+
 session_key = f"terminal_session_{APP_VERSION}"
 session = st.session_state.get(session_key)
 if (not isinstance(session, TerminalSession) or not hasattr(getattr(session, "assistant", None), "situation")
@@ -95,13 +123,18 @@ if (not isinstance(session, TerminalSession) or not hasattr(getattr(session, "as
         else:
             date_key = dt.date.today().isoformat()
         st.session_state.terminal_date = date_key
-    session = TerminalSession(user_id, date_key, dataset_dir=DATASET,
+    # A picker switch defaults the as-of date: pass None so the session keeps
+    # as_of_defaulted and the switch message carries the usual note.
+    session = TerminalSession(user_id, None if switched else date_key, dataset_dir=DATASET,
                               assistant=Assistant(user_id, date_key, dataset_dir=DATASET, no_llm=True))
     st.session_state[session_key] = session
     currency = str(session.assistant.engine.get_user_home_currency(user_id))
     st.session_state.terminal_output = [{"kind": "welcome", "plain_text": BANNER},
                                        {"kind": "text", "plain_text": f"Account currency: {currency}. Amounts without a currency are treated as {currency}."}]
-    if session.as_of_note:
+    if switched:
+        # Same message as the /user command: data range plus defaulted as-of.
+        st.session_state.terminal_output.append({"kind": "text", "plain_text": session.switch_message()})
+    elif session.as_of_note:
         st.session_state.terminal_output.append({"kind": "text", "plain_text": session.as_of_note})
 
 try:
@@ -213,9 +246,13 @@ if line is not None:
     blocks = session.handle(line)
     output = list(output) + [{"kind": "user_input", "plain_text": pending_label or line}] + blocks
     st.session_state.terminal_output = output
-    if line.startswith("/user "):
-        candidate = line.split(maxsplit=1)[1]
-        if candidate in user_ids: st.session_state.terminal_user = candidate
+    switch_arg = user_switch_arg(line)
+    if switch_arg:
+        resolved, _closest = resolve_user_id(switch_arg, user_ids)
+        if resolved:
+            # Same switch semantics as the picker: the defaulted as-of date.
+            st.session_state.terminal_user = resolved
+            st.session_state.terminal_date = None
     if line.startswith("/date "):
         try: st.session_state.terminal_date = dt.date.fromisoformat(line.split(maxsplit=1)[1]).isoformat()
         except ValueError: pass

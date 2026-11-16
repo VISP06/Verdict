@@ -6,7 +6,9 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "code"))
-from terminal_flow import TerminalSession, _STALE_CHOICE, fmt_money, parse_amount
+from terminal_flow import (TerminalSession, _STALE_CHOICE, fmt_money, parse_amount,
+                           profile_summary_text, resolve_user_id, user_picker_options,
+                           user_switch_arg)
 from plan_dates import installment_completion_date
 
 
@@ -164,7 +166,7 @@ def test_deadline_answer_filters_later_installments_and_why_users_are_evidence_b
                   "Options considered:", "Wording: plain text", "Failproof session: chat-"):
         assert label in why
     users = demo.handle("/users INR")[0]["text"]
-    assert "user_07 · INR · ₹" in users
+    assert "INR, installments only: user_07, user_17" in users
     assert len(users.splitlines()) <= 9
 
 
@@ -962,3 +964,75 @@ def test_each_prompt_instance_gets_a_fresh_unique_id():
     session.handle("x")                            # invalid answer -> re-prompt
     third = session.last_blocks[-1]["data"]["id"]
     assert third.endswith("-p3") and third not in {first, second}
+
+
+@pytest.mark.parametrize("line", ["/user_20", "/user 20", "/user USER_20", "/user user20",
+                                  "/u 20", "/user user_20", "/USER_20", "/u 020"])
+def test_lenient_user_switch_variants_all_target_the_same_account(line):
+    session = TerminalSession("user_07", "2024-09-05")
+    response = session.handle(line)[0]["text"]
+    assert response == ("User set to user_20. Data range: 2025-08-13 through 2026-02-06. "
+                        "Using 2026-02-07, the day after your latest bank record.")
+    assert session.user_id == "user_20"
+    assert session.as_of_date == "2026-02-07" and session.as_of_defaulted
+
+
+@pytest.mark.parametrize(("command", "expected"), [("/u", "Usage: /user <id>"), ("/user  ", "Usage: /user <id>")])
+def test_bare_short_user_command_shows_usage(command, expected):
+    session = TerminalSession("user_07", "2024-09-05")
+    assert session.handle(command)[0]["text"] == expected
+
+
+def test_unknown_user_id_lists_three_closest_matches():
+    session = TerminalSession("user_07", "2024-09-05")
+    block = session.handle("/user user9")[0]
+    assert block["kind"] == "error"
+    assert block["text"] == "Unknown user id: user9. Closest: user_09, user_19, user_29."
+
+
+def test_resolve_user_id_accepts_lenient_reference_forms():
+    ids = ["user_01", "user_02", "user_20", "user_100"]
+    for raw in ("USER_20", "20", "020", "user20", "user_20", "20 "):
+        assert resolve_user_id(raw, ids) == ("user_20", []), raw
+    assert resolve_user_id("2", ids)[0] == "user_02"
+    assert resolve_user_id("100", ids)[0] == "user_100"
+    resolved, closest = resolve_user_id("banana", ids)
+    assert resolved is None and len(closest) == 3
+    assert all(uid in ids for uid in closest)
+
+
+def test_user_switch_arg_parses_every_spelling_and_spares_other_commands():
+    assert user_switch_arg("/user_20") == "20"
+    assert user_switch_arg("/USER 20") == "20"
+    assert user_switch_arg("/u 20") == "20"
+    assert user_switch_arg("/user user_20") == "user_20"
+    assert user_switch_arg("/user") == "" and user_switch_arg("/u") == ""
+    for other in ("/users", "/users INR", "/user 20 extra trailing", "/date 2025-01-01", "12k laptop"):
+        assert user_switch_arg(other) is None, other
+
+
+def test_picker_options_labels_and_profile_summary():
+    import pandas as pd
+    profiles = pd.read_csv(os.path.join(ROOT, "dataset", "financial_profiles.csv"), dtype={"user_id": str})
+    options = dict(user_picker_options(profiles))
+    assert options["user_20"] == "user_20 · INR · full, partial, installments (up to 11)"
+    assert options["user_01"] == "user_01 · ZAR · full"
+    assert options["user_02"] == "user_02 · IDR · partial, installments (up to 7)"
+    ids = [uid for uid, _label in user_picker_options(profiles)]
+    assert ids[:3] == ["user_01", "user_02", "user_03"] and ids[-1] == "user_275"
+    row = profiles.set_index("user_id").loc["user_20"]
+    summary = profile_summary_text(row)
+    assert summary.startswith("Currency INR · Balance ₹1,02,609.05 · Minimum ₹64,500.00 · Accepts: full, partial, installments (up to 11)")
+
+
+def test_users_listing_groups_by_currency_and_accepted_methods():
+    session = TerminalSession("user_07", "2024-09-05")
+    listing = session.handle("/users")[0]["text"]
+    assert listing.startswith("Accounts, grouped by accepted methods:\n")
+    assert "INR, installments only: user_07, user_17" in listing
+    assert "INR, full + partial + installments: user_20, user_86" in listing
+    filtered = session.handle("/users INR")[0]["text"]
+    assert filtered.startswith("Accounts in INR, grouped by accepted methods:\n")
+    assert "INR, installments only: user_07, user_17" in filtered
+    assert not any(line.startswith(("EUR,", "IDR,", "USD,", "ZAR,")) for line in filtered.splitlines()[1:])
+    assert session.handle("/users ZZZ")[0]["text"].endswith("\nNo matching accounts.")

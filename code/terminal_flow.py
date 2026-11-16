@@ -2,6 +2,7 @@
 
 import datetime as dt
 import calendar
+import difflib
 import html
 import json
 import math
@@ -27,6 +28,130 @@ _AMOUNT_RE = re.compile(
 )
 BANNER = ("Glacier checks whether a payment fits your next 90 days: your balance, income, bills and pending items, "
           "and tells you whether to pay now, split it, or wait.")
+
+# Short method names in profile order, used by the account picker, the picker
+# labels and the grouped /users listing.
+_METHOD_WORDS = (("full_payment", "full"), ("partial_payment", "partial"), ("installments", "installments"))
+
+_USER_SWITCH_RE = re.compile(
+    r"^/user_(?P<glued>\S+?)\s*$|^/user\s+(?P<spaced>\S+?)\s*$|^/u\s+(?P<short>\S+?)\s*$"
+    r"|^/user\s*$|^/u\s*$", re.I)
+
+
+def _is_missing(value):
+    """True for NaN/None profile cells."""
+    if value is None:
+        return True
+    try:
+        return math.isnan(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def profile_methods(raw):
+    """Allowed method keys from a payment_methods_user_will_consider cell."""
+    allowed = {item.strip().lower() for item in str(raw or "").split("|") if item.strip()}
+    return allowed or {"full_payment"}
+
+
+def methods_label(methods, installment_cap=None):
+    """Picker-style method text: 'full, partial, installments (up to 11)'."""
+    names = [word for key, word in _METHOD_WORDS if key in methods]
+    if not names:
+        return "waiting"
+    text = ", ".join(names)
+    if installment_cap and "installments" in methods:
+        text += f" (up to {int(installment_cap)})"
+    return text
+
+
+def _user_sort_key(user_id):
+    """Natural order for user_NN ids: user_02 before user_100."""
+    match = re.search(r"(\d+)$", str(user_id))
+    return (int(match.group(1)) if match else 10 ** 9, str(user_id))
+
+
+def user_picker_options(profiles_frame):
+    """(user_id, picker label) pairs in natural order, one per profile row."""
+    rows = []
+    for _, row in profiles_frame.iterrows():
+        user_id = str(row.user_id if hasattr(row, "user_id") else row.name)
+        methods = profile_methods(row.get("payment_methods_user_will_consider", ""))
+        cap = None if _is_missing(row.get("max_installment_months")) else int(row["max_installment_months"])
+        rows.append((user_id, f"{user_id} · {row.home_currency} · {methods_label(methods, cap)}"))
+    rows.sort(key=lambda item: _user_sort_key(item[0]))
+    return rows
+
+
+def profile_summary_text(row):
+    """One-line account summary: currency, balance, minimum, accepted methods."""
+    currency = str(row.home_currency)
+    methods = profile_methods(row.get("payment_methods_user_will_consider", ""))
+    cap = None if _is_missing(row.get("max_installment_months")) else int(row["max_installment_months"])
+    return (f"Currency {currency} · Balance {fmt_money(row.current_available_balance, currency)} · "
+            f"Minimum {fmt_money(row.minimum_balance_to_keep, currency)} · "
+            f"Accepts: {methods_label(methods, cap)}")
+
+
+def users_grouped_lines(profiles_frame):
+    """Compact /users lines: one per currency and accepted-method combination."""
+    groups = {}
+    for _, row in profiles_frame.iterrows():
+        user_id = str(row.user_id if hasattr(row, "user_id") else row.name)
+        methods = frozenset(profile_methods(row.get("payment_methods_user_will_consider", "")))
+        groups.setdefault((str(row.home_currency), methods), []).append(user_id)
+    lines = []
+    for currency, methods in sorted(groups, key=lambda key: (key[0], len(key[1]), sorted(key[1]))):
+        names = [word for key, word in _METHOD_WORDS if key in methods]
+        label = f"{names[0]} only" if len(names) == 1 else " + ".join(names)
+        ids = ", ".join(sorted(groups[(currency, methods)], key=_user_sort_key))
+        lines.append(f"{currency}, {label}: {ids}")
+    return lines
+
+
+def user_switch_arg(line):
+    """The id text of a /user switch command in any accepted spelling, else None.
+
+    Accepts /user ID, /user_ID (glued) and /u ID, case-insensitively;
+    /users is never a switch. Returns '' for the bare commands, which the
+    caller answers with the usage line, and None for non-switch lines.
+    """
+    match = _USER_SWITCH_RE.match(str(line or "").strip())
+    if not match:
+        return None
+    arg = match.group("glued") or match.group("spaced") or match.group("short")
+    return arg.strip() if arg else ""
+
+
+def resolve_user_id(raw, user_ids, suggestions=3):
+    """Resolve a lenient account reference to an exact user id.
+
+    Accepts 'user_20', 'USER_20', 'user20', '20' and '2' (numeric suffixes,
+    padded or not); returns (user_id, closest) where user_id is None when
+    nothing matches and closest holds up to three nearest ids for the error.
+    """
+    text = str(raw or "").strip().strip("\"'")
+    ids = [str(uid) for uid in user_ids]
+    if not text:
+        return None, []
+    if text in ids:
+        return text, []
+    norm = re.sub(r"[\s_-]+", "", text.lower())
+    if norm.isdigit():
+        number = int(norm)
+        for uid in ids:
+            suffix = re.search(r"(\d+)$", uid)
+            if suffix and int(suffix.group(1)) == number:
+                return uid, []
+    bare = re.sub(r"^user", "", norm)
+    for uid in ids:
+        key = re.sub(r"[\s_-]+", "", uid.lower())
+        if norm == key or (bare and bare == re.sub(r"^user", "", key)):
+            return uid, []
+    scored = sorted(ids, key=lambda uid: -max(
+        difflib.SequenceMatcher(None, norm, re.sub(r"[\s_-]+", "", uid.lower())).ratio(),
+        difflib.SequenceMatcher(None, bare, re.sub(r"^user", "", re.sub(r"[\s_-]+", "", uid.lower()))).ratio()))
+    return None, scored[:suggestions]
 
 
 def parse_amount(text):
@@ -2478,6 +2603,17 @@ class TerminalSession:
             return False
         return True
 
+    def _switch_user(self, user_id):
+        """Switch account: fresh state and the defaulted as-of date."""
+        self.__init__(user_id, None, self.dataset_dir)
+        self._block("text", self.switch_message())
+
+    def switch_message(self):
+        """The usual 'User set to ...' line: data range plus defaulted as-of note."""
+        first, last = self._event_range()
+        note = self.as_of_note or ""
+        return f"User set to {self.user_id}. Data range: {first} through {last}. {note}"
+
     def handle(self, line):
         self.last_blocks = []
         text = str(line or "").strip()
@@ -2496,9 +2632,9 @@ class TerminalSession:
             profiles = self.assistant.engine.profiles
             if requested:
                 profiles = profiles[profiles.home_currency.astype(str).str.upper().eq(requested)]
-            lines = [f"{uid} · {row.home_currency} · {fmt_money(row.current_available_balance, row.home_currency)}"
-                     for uid, row in profiles.head(8).iterrows()]
-            self._block("text", "Accounts" + (f" in {requested}" if requested else "") + ":\n" + ("\n".join(lines) or "No matching accounts."))
+            lines = users_grouped_lines(profiles)
+            header = ("Accounts in " + requested if requested else "Accounts") + ", grouped by accepted methods:"
+            self._block("text", header + "\n" + ("\n".join(lines) or "No matching accounts."))
         elif command == "/export":
             if self.report:
                 text = self.render_report(self.report)
@@ -2535,15 +2671,17 @@ class TerminalSession:
                 checked, urls = sources
                 self._block("text", "Loan reference sources, checked " + checked + ":\n"
                             + "\n".join(f"- {url}" for url in urls))
-        elif command == "/user": self._block("text", "Usage: /user <id>")
-        elif command.startswith("/user "):
-            new_user = text.split(maxsplit=1)[1]
-            if new_user not in self.assistant.engine.profiles.index.astype(str): self._block("error", f"Unknown user id: {new_user}")
+        elif user_switch_arg(text) is not None:
+            arg = user_switch_arg(text)
+            if not arg:
+                self._block("text", "Usage: /user <id>")
             else:
-                self.__init__(new_user, None, self.dataset_dir)
-                first, last = self._event_range()
-                note = self.as_of_note or ""
-                self._block("text", f"User set to {new_user}. Data range: {first} through {last}. {note}")
+                resolved, closest = resolve_user_id(
+                    arg, self.assistant.engine.profiles.index.astype(str))
+                if resolved is None:
+                    self._block("error", f"Unknown user id: {arg}. Closest: {', '.join(closest)}.")
+                else:
+                    self._switch_user(resolved)
         elif command == "/date": self._block("text", "Usage: /date YYYY-MM-DD")
         elif command.startswith("/date "):
             value = text.split(maxsplit=1)[1]

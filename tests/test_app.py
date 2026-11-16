@@ -186,3 +186,45 @@ def test_options_table_scrolls_horizontally_on_narrow_screens(monkeypatch):
     assert '<div class="options-scroll"><table class="options-table">' in md
     assert "white-space:nowrap" in md          # headers never wrap
     assert "overflow-x:auto" in md
+
+
+def test_user_selectbox_switches_account_resets_and_defaults_as_of(monkeypatch):
+    _offline(monkeypatch)
+    at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=60).run()
+    assert not at.exception
+    assert len(at.selectbox) == 1 and at.selectbox[0].value == "user_07"
+    md = "\n".join(x.value for x in at.markdown)
+    # Profile summary sits under the always-visible picker in the main area.
+    assert "Currency INR · Balance ₹2,18,945.56 · Minimum ₹93,000.00 · Accepts: installments (up to 12)" in md
+    # An intake in progress is thrown away by the switch.
+    at.chat_input[0].set_value("Laptop costs 12k").run()
+    session_key = "terminal_session_glacier-terminal-v4"
+    assert at.session_state[session_key].phase == "intake"
+    at.selectbox[0].set_value("user_20").run()
+    assert not at.exception
+    assert at.session_state["terminal_user"] == "user_20"
+    session = at.session_state[session_key]
+    assert session.user_id == "user_20"
+    assert session.phase == "ready" and not session.form
+    assert session.as_of_date == "2026-02-07" and session.as_of_defaulted
+    md = "\n".join(x.value for x in at.markdown)
+    assert ("User set to user_20. Data range: 2025-08-13 through 2026-02-06. "
+            "Using 2026-02-07, the day after your latest bank record.") in md
+    assert '<span class="chip"><span class="label">user </span>user_20</span>' in md
+    assert "Accepts: full, partial, installments (up to 11)" in md
+
+
+def test_user_line_variants_switch_account_and_sync_the_picker(monkeypatch):
+    _offline(monkeypatch)
+    at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=60).run()
+    at.chat_input[0].set_value("/user USER_23").run()
+    assert not at.exception
+    assert at.session_state["terminal_user"] == "user_23"
+    assert at.selectbox[0].value == "user_23"   # the picker follows the command
+    md = "\n".join(x.value for x in at.markdown)
+    assert ("User set to user_23. Data range: 2024-11-13 through 2025-05-06. "
+            "Using 2025-05-07, the day after your latest bank record.") in md
+    at.chat_input[0].set_value("/user banana").run()
+    md = "\n".join(x.value for x in at.markdown)
+    assert "Unknown user id: banana. Closest: user_01, user_02, user_03." in md
+    assert at.session_state["terminal_user"] == "user_23"  # unknown id never switches

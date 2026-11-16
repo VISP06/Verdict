@@ -209,7 +209,7 @@ def test_user_selectbox_switches_account_resets_and_defaults_as_of(monkeypatch):
     assert session.as_of_date == "2026-02-07" and session.as_of_defaulted
     md = "\n".join(x.value for x in at.markdown)
     assert ("User set to user_20. Data range: 2025-08-13 through 2026-02-06. "
-            "Using 2026-02-07, the day after your latest bank record.") in md
+             "Using 2026-02-07, the date of your request.") in md
     assert '<span class="chip"><span class="label">user </span>user_20</span>' in md
     assert "Accepts: full, partial, installments (up to 11)" in md
 
@@ -223,7 +223,7 @@ def test_user_line_variants_switch_account_and_sync_the_picker(monkeypatch):
     assert at.selectbox[0].value == "user_23"   # the picker follows the command
     md = "\n".join(x.value for x in at.markdown)
     assert ("User set to user_23. Data range: 2024-11-13 through 2025-05-06. "
-            "Using 2025-05-07, the day after your latest bank record.") in md
+             "Using 2025-05-07, the date of your request.") in md
     at.chat_input[0].set_value("/user banana").run()
     md = "\n".join(x.value for x in at.markdown)
     assert "Unknown user id: banana. Closest: user_01, user_02, user_03." in md

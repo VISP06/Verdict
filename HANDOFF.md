@@ -64,6 +64,17 @@ python code/terminal.py --user user_07          # same engine in a shell
 - UI palette: dark "glacier" (`#08141F`, frost `#D8F3FF`, cyan `#5CE1E6`, mint `#7CF5C0`, amber `#FFD479`, coral `#FF7A90`), font JetBrains Mono. Avoid the cream/teal/vermilion palette (too similar to another project of the author).
 - `options[*].dates` / `amounts` are dicts keyed by ISO date. `situation["monthly_income_total"]` is actually the **90-day total** of counted income (misnamed; text was corrected, key was not).
 
+## 6.1 Task 3 interactive-flow changes
+
+The terminal and Streamlit switcher now default each account to its request
+date, falling back to the day after the last bank event only when no request
+row exists; `/date` remains an override.  Income classifications cached for a
+user's series are reused on alternate as-of dates with a single disclosure in
+WHY.  Zero or negative monthly room now uses explicit regular-income and
+spending language instead of claiming a zero-sized payment plan, including in
+the illustrative loan section.  Tests cover request-date defaults, cached
+income at the default, and the zero-room wording.
+
 ## 7. Open work, in priority order
 
 1. **Apply payroll dates (and raises) from employer messages in the forecast.** 57 employer messages contain dates: moved payday, raise effective date, first salary credit, salary resumes. Evidence: user_07's message (2024-08-29) says the salary is now expected 2024-09-23 but the forecast uses the 15th; forcing the payday to the 23rd in a test made request_07's earliest date **2024-10-23, exactly the expected value** (safe amount still differs). Needs a validated extraction (LLM into the classifier schema, dates must appear in the message) or a deterministic ISO-date rule, then re-run evaluate and confirm no regressions.

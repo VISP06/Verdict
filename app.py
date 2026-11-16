@@ -12,7 +12,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "code"))
 from assistant import Assistant
 from terminal_flow import (BANNER, TerminalSession, fmt_money, profile_summary_text,
-                           resolve_user_id, user_picker_options, user_switch_arg)
+                           request_date_for_user, resolve_user_id, user_picker_options,
+                           user_switch_arg)
 
 APP_VERSION = "glacier-terminal-v4"
 DATASET = os.path.join(ROOT, "dataset")
@@ -115,13 +116,17 @@ session = st.session_state.get(session_key)
 if (not isinstance(session, TerminalSession) or not hasattr(getattr(session, "assistant", None), "situation")
         or session.user_id != user_id or (date_key and session.as_of_date != date_key)):
     if date_key is None:
-        assistant = Assistant(user_id, dt.date.today().isoformat(), dataset_dir=DATASET, no_llm=True)
-        dates = assistant.engine.events[assistant.engine.events.user_id.astype(str).eq(user_id)].event_date.astype(str)
-        if len(dates):
-            last = sorted(dates.astype(str))[-1][:10]
-            date_key = (dt.date.fromisoformat(last) + dt.timedelta(days=1)).isoformat()
-        else:
-            date_key = dt.date.today().isoformat()
+        # The defaulted as-of date is the user's own request date; last bank
+        # event + 1 only when the user has no request row at all.
+        date_key = request_date_for_user(user_id, DATASET)
+        if date_key is None:
+            assistant = Assistant(user_id, dt.date.today().isoformat(), dataset_dir=DATASET, no_llm=True)
+            dates = assistant.engine.events[assistant.engine.events.user_id.astype(str).eq(user_id)].event_date.astype(str)
+            if len(dates):
+                last = sorted(dates.astype(str))[-1][:10]
+                date_key = (dt.date.fromisoformat(last) + dt.timedelta(days=1)).isoformat()
+            else:
+                date_key = dt.date.today().isoformat()
         st.session_state.terminal_date = date_key
     # A picker switch defaults the as-of date: pass None so the session keeps
     # as_of_defaulted and the switch message carries the usual note.

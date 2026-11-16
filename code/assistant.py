@@ -70,6 +70,7 @@ class Assistant:
         self.dataset_dir = dataset_dir
         self.client = client or completion
         self.no_llm = bool(no_llm)
+        self.reuse_cached_income = False
         self.model = (os.getenv("CHAT_MODEL") or os.getenv("EXPLAIN_MODEL")
                       or os.getenv("BUY_OR_WAIT_MODEL") or "gemini/gemini-1.5-flash")
         self.run_id = new_run_id()
@@ -78,6 +79,7 @@ class Assistant:
         self.context = None
         self.awaiting_clarification = False
         self.last_decision = None
+        self.income_reuse_dates = {}
         self.engine = FinancialEngine(dataset_dir)
         self._call_deadline = None
         self.model_unavailable = False
@@ -489,6 +491,17 @@ class Assistant:
             with fp.agent("assistant", goal="Compare payment options with the deterministic forecast"):
                 return self._advise(form)
 
+    def _record_income_reuse(self, classifier):
+        """Keep the dates whose income classification was reused for this session.
+
+        Set fresh on every classify call, so the terminal's note describes the
+        answer actually shown now, not an earlier override.
+        """
+        reuse = getattr(classifier, "last_reuse", []) or []
+        self.income_reuse_dates = {entry["series_key"]: str(entry.get("prepared_date") or "")
+                                   for entry in reuse
+                                   if str(entry.get("user_id")) == self.user_id}
+
     def situation(self):
         """Compute the no-payment baseline and evidence without making any model call."""
         with fp.session(self.session_id):
@@ -498,7 +511,9 @@ class Assistant:
                                          "request_date": self.as_of_date}])
                 classifier = IncomeClassifier(self.dataset_dir)
                 classes = classifier.classify_requests(
-                    request, environment="calibration", sleep_between_users=0)
+                    request, environment="calibration", sleep_between_users=0,
+                    reuse_cached=self.reuse_cached_income)
+                self._record_income_reuse(classifier)
                 balances, minimum, breakdown = self.engine.simulate_90_days(
                     self.user_id, self.as_of_date, return_breakdown=True,
                     income_classes=classes, **FORECAST_CONFIG)
@@ -553,9 +568,12 @@ class Assistant:
         if error:
             raise ValueError(error)
         profile = self.engine.profiles.loc[self.user_id]
-        classes = IncomeClassifier(self.dataset_dir).classify_requests(
+        classifier = IncomeClassifier(self.dataset_dir)
+        classes = classifier.classify_requests(
             pd.DataFrame([{"request_id": f"advise_{self.run_id}", "user_id": self.user_id,
-                           "request_date": self.as_of_date}]), environment="calibration", sleep_between_users=0)
+                           "request_date": self.as_of_date}]), environment="calibration", sleep_between_users=0,
+            reuse_cached=self.reuse_cached_income)
+        self._record_income_reuse(classifier)
         amount = self._home_amount(intent["amount"], intent["currency"])[0]
         baseline, minimum, breakdown = self.engine.simulate_90_days(
             self.user_id, self.as_of_date, return_breakdown=True, income_classes=classes,

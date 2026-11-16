@@ -39,6 +39,8 @@ class IncomeClassifier:
         self.model_name = model_name or os.getenv("INCOME_CLASSIFIER_MODEL") or os.getenv("BUY_OR_WAIT_MODEL", "gemini/gemini-1.5-flash")
         self.model_calls = 0
         self.cache_hits = 0
+        self.reuse_hits = 0
+        self.last_reuse = []
         self.failures = 0
         self.failure_details = []
         self.circuit_breaker_error = None
@@ -108,6 +110,23 @@ class IncomeClassifier:
     def _cache_key(self, payload):
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
         return hashlib.sha256(f"{PROMPT_VERSION}\n{raw}".encode()).hexdigest()
+
+    def _reuse_cached(self, cache, user_id, series_key):
+        """An earlier classification of the same user and income series, or None.
+
+        A date the cache never saw still reuses the classification prepared for
+        the user's own request date, so income is never silently counted as
+        zero just because the question is asked about another day.  Reuse is
+        read-only: nothing is written back, and ties are broken deterministically
+        by the earliest request date.
+        """
+        candidates = [row for (_key, sk), row in cache.items()
+                      if sk == series_key and str(row.get("user_id")) == str(user_id)
+                      and row.get("class") in CLASSES - {"unknown"}]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda row: (str(row.get("request_date") or ""),
+                                                str(row.get("cache_key") or "")))
 
     def _load_cache(self):
         if not os.path.exists(self.cache_path):
@@ -199,7 +218,8 @@ class IncomeClassifier:
         return validated
 
     def classify_requests(self, requests_df, environment="dev", print_summary=False,
-                          sleep_between_users=None, max_retries=4, run_id=None):
+                          sleep_between_users=None, max_retries=4, run_id=None,
+                          reuse_cached=False):
         run_id = run_id or new_run_id()
         if sleep_between_users is None:
             sleep_between_users = float(os.getenv("INCOME_FILL_DELAY", "8"))
@@ -223,7 +243,15 @@ class IncomeClassifier:
                         self.cache_hits += 1
                         output[(user_id, snap["request_date"], series_key)] = cached
                     else:
-                        has_missing = True
+                        reused = self._reuse_cached(cache, user_id, series_key) if reuse_cached else None
+                        if reused is not None:
+                            self.reuse_hits += 1
+                            output[(user_id, snap["request_date"], series_key)] = reused
+                            self.last_reuse.append({"user_id": user_id, "request_date": snap["request_date"],
+                                                    "series_key": series_key,
+                                                    "prepared_date": str(reused.get("request_date") or "")})
+                        else:
+                            has_missing = True
                 if has_missing:
                     pending.append(snap)
             if pending:

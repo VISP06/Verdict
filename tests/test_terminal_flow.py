@@ -30,6 +30,9 @@ def test_parse_amount(text, expected, currency):
 
 def start(text="Can I afford a 12k laptop?"):
     session = TerminalSession("user_05", "2025-11-04")
+    # These legacy intake tests pin the pre-reuse behavior for an explicitly
+    # chosen date; task-3 reuse is covered by the default-date tests below.
+    session.assistant.reuse_cached_income = False
     blocks = session.handle(text)
     return session, blocks
 
@@ -220,13 +223,13 @@ def test_user_resets_to_latest_event_date_and_date_error_has_range():
     assert "Allowed range" in error and "through" in error
 
 
-def test_default_as_of_is_day_after_latest_event():
-    for user_id, expected in (("user_05", "2025-11-05"), ("user_07", "2024-09-05"),
+def test_default_as_of_is_request_date():
+    for user_id, expected in (("user_05", "2025-11-06"), ("user_07", "2024-09-05"),
                               ("user_20", "2026-02-07"), ("user_23", "2025-05-07")):
         session = TerminalSession(user_id)
         assert session.as_of_date == expected
         assert session.as_of_defaulted
-        assert session.as_of_note == f"Using {expected}, the day after your latest bank record."
+        assert session.as_of_note == f"Using {expected}, the date of your request."
     session = TerminalSession("user_07", "2024-09-04")
     assert not session.as_of_defaulted
     assert session.as_of_note is None
@@ -236,8 +239,30 @@ def test_user_switch_uses_default_as_of_note():
     session = TerminalSession("user_07", "2024-09-05")
     response = session.handle("/user user_23")[0]["text"]
     assert response == ("User set to user_23. Data range: 2024-11-13 through 2025-05-06. "
-                        "Using 2025-05-07, the day after your latest bank record.")
-    assert session.as_of_date == "2025-05-07"
+                        "Using 2025-05-07, the date of your request.")
+
+
+@pytest.mark.parametrize(("user_id", "request_date"), [
+    ("user_86", "2025-08-03"), ("user_09", "2026-07-04"),
+    ("user_01", "2024-03-03"),
+])
+def test_default_as_of_matches_request_date(user_id, request_date):
+    assert TerminalSession(user_id).as_of_date == request_date
+
+
+def test_user_86_default_counts_cached_income():
+    situation = TerminalSession("user_86").assistant.situation()
+    assert situation["monthly_income_total"] > 0
+
+
+def test_user_10_zero_room_wording_is_honest():
+    session = TerminalSession("user_10")
+    blocks = session.handle("I want to buy a car worth 12 lakh. How can I finance this?")
+    text = "\n".join(block.get("text", "") for block in blocks)
+    assert "No installment or loan payment can be supported right now" in text
+    assert "none of your income is counted as regular" in text
+    assert "up to ₹0.00" not in text
+    assert "monthly room of ₹0" not in text
 
 
 def test_date_before_history_blocks_advice_with_guard_message():
@@ -972,7 +997,7 @@ def test_lenient_user_switch_variants_all_target_the_same_account(line):
     session = TerminalSession("user_07", "2024-09-05")
     response = session.handle(line)[0]["text"]
     assert response == ("User set to user_20. Data range: 2025-08-13 through 2026-02-06. "
-                        "Using 2026-02-07, the day after your latest bank record.")
+                        "Using 2026-02-07, the date of your request.")
     assert session.user_id == "user_20"
     assert session.as_of_date == "2026-02-07" and session.as_of_defaulted
 

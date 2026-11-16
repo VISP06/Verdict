@@ -71,6 +71,35 @@ def _user_sort_key(user_id):
     return (int(match.group(1)) if match else 10 ** 9, str(user_id))
 
 
+def request_date_for_user(user_id, dataset_dir):
+    """The date of the user's own request, or None when they have none.
+
+    Every user has exactly one row in requests.csv (or sample_requests.csv for
+    the sample users); that request date, not the newest bank event, is the
+    day their question is about.
+    """
+    import pandas as pd
+    for name in ("requests.csv", "sample_requests.csv"):
+        path = os.path.join(dataset_dir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            frame = pd.read_csv(path)
+        except Exception:
+            continue
+        if "user_id" not in frame.columns or "request_date" not in frame.columns:
+            continue
+        rows = frame[frame["user_id"].astype(str) == str(user_id)]
+        if rows.empty:
+            continue
+        value = str(rows.iloc[0]["request_date"])[:10]
+        try:
+            return dt.date.fromisoformat(value).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 def user_picker_options(profiles_frame):
     """(user_id, picker label) pairs in natural order, one per profile row."""
     rows = []
@@ -351,12 +380,15 @@ class TerminalSession:
         self.dataset_dir = dataset_dir or os.path.join(os.path.dirname(__file__), "..", "dataset")
         self.assistant = assistant
         if assistant is None:
-            assistant = Assistant(user_id, as_of_date or self._latest_date(user_id),
+            assistant = Assistant(user_id, as_of_date or self._default_as_of(user_id),
                                   dataset_dir=self.dataset_dir, no_llm=True)
         self.assistant = assistant
+        self.assistant.reuse_cached_income = True
         self.user_id = str(user_id)
         self.as_of_date = str(as_of_date or assistant.as_of_date)[:10]
         self.as_of_defaulted = as_of_date is None
+        self.as_of_from_request = bool(self.as_of_defaulted
+                                       and request_date_for_user(self.user_id, self.dataset_dir))
         if self.user_id not in self.assistant.engine.profiles.index.astype(str):
             raise ValueError(f"Unknown user id: {self.user_id}")
         self.run_id = assistant.run_id
@@ -389,8 +421,14 @@ class TerminalSession:
     def as_of_note(self):
         """Line shown when the as-of date was defaulted rather than overridden."""
         if getattr(self, "as_of_defaulted", False):
+            if getattr(self, "as_of_from_request", False):
+                return f"Using {self.as_of_date}, the date of your request."
             return f"Using {self.as_of_date}, the day after your latest bank record."
         return None
+
+    def _default_as_of(self, user_id):
+        """Defaulted as-of date: the user's request date, else last bank event + 1."""
+        return request_date_for_user(user_id, self.dataset_dir) or self._latest_date(user_id)
 
     def _earliest_installment_completion(self):
         return installment_completion_date(self.as_of_date, min(self.installment_counts))
@@ -884,39 +922,46 @@ class TerminalSession:
                          f"and no payment today keeps your balance above the minimum.")
         largest = 0.0
         fit = "nothing with your current balance and history"
+        income = float(situation.get("monthly_income_total") or 0)
+        room = income - self._history_outflow_average()
         if "full_payment" in allowed:
             full_limit = self._floor_cents(largests["full_payment"])
-            lines.append(f"Pay in full: up to {self._money(full_limit, home)} today, in one payment.")
+            if full_limit > 0:
+                lines.append(f"Pay in full: up to {self._money(full_limit, home)} today, in one payment.")
+            else:
+                lines.append("Pay in full: no amount is safe today, because no payment keeps your "
+                             "balance above the minimum.")
             if full_limit > largest:
                 largest, fit = full_limit, f"up to {self._money(full_limit, home)} paid in full today"
         part = largests.get("partial_payment")
         if part:
             part_amount, part_day = part
-            lines.append(f"Part now, rest later: up to {self._money(part_amount, home)} if you pay "
-                         f"half now and half on {self._short(part_day)}.")
+            if float(part_amount) > 0:
+                lines.append(f"Part now, rest later: up to {self._money(part_amount, home)} if you pay "
+                             f"half now and half on {self._short(part_day)}.")
+            else:
+                lines.append("Part now, rest later: no part payment is safe today.")
             if part_amount > largest:
                 largest, fit = part_amount, (f"up to {self._money(part_amount, home)} paying half now "
                                              f"and half on {self._short(part_day)}")
         inst = largests.get("installments")
-        if inst:
+        if inst and float(inst[0]) > 0:
             inst_amount, per, count = inst
             lines.append(f"Installments: a purchase of up to {self._money(inst_amount, home)} over "
                          f"{count} months — about {self._money(per, home)} a month.")
-            income = float(situation.get("monthly_income_total") or 0)
             outflow = self._history_outflow_average()
             room = income - outflow
-            if income > 0 or outflow > 0:
+            if room > 0:
                 lines.append(f"That monthly payment stays within the estimated monthly room of "
                              f"{self._prose(max(0.0, room))} — counted income {self._prose(income)} minus "
                              f"average outflows {self._prose(outflow)} over your last 3 months of history. "
                              f"Payments in the next 90 days keep your balance above the minimum; "
                              f"beyond 90 days it is an estimate.")
-            else:
-                lines.append("Your history has no counted income or recurring outflows for this date, "
-                             "so the 90-day forecast is the real check; beyond 90 days it is an estimate.")
             if inst_amount > largest:
                 largest, fit = inst_amount, (f"a purchase of up to {self._money(inst_amount, home)} "
                                              f"over {count} months")
+        if room <= 0:
+            lines.append(self._zero_room_line(situation, home))
         lines.append(f"What would fit: {fit}.")
         lines.append("Based on: your profile, your bank history, your last 3 months of outflows "
                      "and the engine's 90-day forecast.")
@@ -962,7 +1007,9 @@ class TerminalSession:
             per = self._money(round(amount / inst_count, 2), home)
             income = float(situation.get("monthly_income_total") or 0)
             outflow = self._history_outflow_average()
-            if income > 0 or outflow > 0:
+            if income - outflow <= 0:
+                room_text = None
+            elif income > 0 or outflow > 0:
                 room_text = (f"your estimated monthly room of "
                              f"{self._prose(max(0.0, income - outflow))}")
             else:
@@ -973,8 +1020,11 @@ class TerminalSession:
             else:
                 lines.append("Not all today, but installments would cover it.")
             lines.append(f"Safe to pay today: {self._money(capacity, home)}.")
-            lines.append(f"It fits as up to {inst_count} installments of about {per} a month, within "
-                         f"the 90-day forecast and {room_text}.")
+            if room_text:
+                lines.append(f"It fits as up to {inst_count} installments of about {per} a month, within "
+                             f"the 90-day forecast and {room_text}.")
+            else:
+                lines.append(self._zero_room_line(situation, home))
         lines.append("Based on: your profile, your bank history, your last 3 months of outflows "
                      "and the engine's 90-day forecast.")
         return "\n".join(lines)
@@ -983,6 +1033,34 @@ class TerminalSession:
         """The same counted-income-minus-recurring-outflows room as the snapshot."""
         income = float(situation.get("monthly_income_total") or 0)
         return max(0.0, income - self._history_outflow_average())
+
+    def _income_reason_words(self):
+        """Why the income classification counts no income as regular, in its own words."""
+        reasons = []
+        for key, row in sorted(self._split_income_classes().items()):
+            if len(key) < 3 or str(key[0]) != self.user_id:
+                continue
+            if str(row.get("class", "")) == "confirmed_recurring":
+                continue
+            reason = str(row.get("reason") or "").strip().rstrip(".").strip()
+            if reason and reason not in reasons:
+                reasons.append(reason)
+        if reasons:
+            return "; ".join(reasons)
+        return "your recent history has no income payments to classify"
+
+    def _zero_room_line(self, situation, home=None):
+        """The honest line when counted income leaves no monthly room at all."""
+        currency = home or self.form.get("currency", "INR")
+        income = float(situation.get("monthly_income_total") or 0)
+        outflow = self._history_outflow_average()
+        if income > 0:
+            return (f"No installment or loan payment can be supported right now: your counted income "
+                    f"{self._money(income, currency)} a month does not cover your average outflows "
+                    f"{self._money(outflow, currency)} a month.")
+        return (f"No installment or loan payment can be supported right now: none of your income is "
+                f"counted as regular ({self._income_reason_words()}), while you spend about "
+                f"{self._money(outflow, currency)} a month.")
 
     def _loan_reference_for_request(self):
         reference = _load_loan_reference()
@@ -1020,6 +1098,9 @@ class TerminalSession:
             fits = monthly <= room + 1e-9
             lines.append(f"{years} years: about {self._money(monthly)} a month.")
             lines.append(f"Total interest over {years} years: {self._money(total_interest)}.")
+            if room <= 0:
+                lines.append(self._zero_room_line(situation, currency))
+                break
             lines.append(f"That payment {'fits' if fits else 'does not fit'} "
                          f"your monthly room of {self._money(room)}.")
         longest = max(tenures)
@@ -1034,9 +1115,13 @@ class TerminalSession:
                      f"{low:g}% to {high:g}% a year (checked {date_text}).")
         if longest_payment > room + 1e-9:
             lines.append(f"Even over {longest} years the payment would be {self._money(longest_payment)} "
-                         f"against your monthly room of {self._money(room)}.")
+                         + ("against no counted monthly room."
+                            if room <= 0 else f"against your monthly room of {self._money(room)}."))
             lines.append("A loan this size isn't realistic.")
-            lines.append(f"A loan of up to {self._money(fitting)} would fit.")
+            if room <= 0:
+                lines.append("Lenders look for regular income, and none is counted for you right now.")
+            else:
+                lines.append(f"A loan of up to {self._money(fitting)} would fit.")
         lines.append("This is an illustration, not a quote or financial advice.")
         lines.append("Lenders also check your credit score and income.")
         lines.append("Compare offers before applying.")
@@ -2255,8 +2340,22 @@ class TerminalSession:
             lines.append(f"{len(considered)} unsettled bank {noun} already counted in this forecast.")
         else:
             lines.append("No unsettled bank items affect this.")
+        reuse_note = self._income_reuse_note()
+        if reuse_note:
+            lines.append(reuse_note)
         lines.append(self._based_on_line(result))
         return "\n".join(lines)
+
+    def _income_reuse_note(self):
+        """One honest line when income classes prepared for another date were reused."""
+        reuse = getattr(self.assistant, "income_reuse_dates", None) or {}
+        dates = sorted({str(date) for date in reuse.values() if date and date != self.as_of_date})
+        if not dates:
+            return None
+        if len(dates) == 1:
+            return f"Income classification was prepared for {dates[0]}; other dates reuse it."
+        return (f"Income classification was prepared for {', '.join(dates[:-1])} and {dates[-1]}; "
+                f"other dates reuse it.")
 
     def _wait_methods_words(self):
         allowed = self.assistant._profile_allowed_methods()

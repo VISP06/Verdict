@@ -1036,3 +1036,156 @@ def test_users_listing_groups_by_currency_and_accepted_methods():
     assert "INR, installments only: user_07, user_17" in filtered
     assert not any(line.startswith(("EUR,", "IDR,", "USD,", "ZAR,")) for line in filtered.splitlines()[1:])
     assert session.handle("/users ZZZ")[0]["text"].endswith("\nNo matching accounts.")
+
+
+# --- Named payment methods: a safe named method becomes the verdict ---
+
+def test_named_installments_that_are_safe_become_the_verdict():
+    # The reported bug: user_20's safe 6-installment plan used to lose to the
+    # engine's wait pick; the named method now wins and the engine's pick is
+    # offered as the plain-words alternative.
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I pay ₹50,000 in 6 installments?")
+    session.handle("")                     # no deadline
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ PAY IN 6 INSTALLMENTS ─╮"
+    assert "You could also wait until 15 Feb and pay in full at no extra cost." in report
+    chosen = session.report["recommended_option"]
+    assert chosen["type"] == "installments" and chosen["safe"] is True
+    decision = session.report["decision"]
+    assert decision["affordability_status"] == "affordable_with_plan"
+    assert decision["recommended_payment_method"] == "installments"
+    assert session.report_data(session.report)["status"] == "good"
+
+
+def test_named_installments_that_are_unsafe_say_so_and_fall_back():
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I pay ₹1,00,000 in 6 installments?")
+    session.handle("")                     # no deadline
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0].startswith("╭─ WAIT UNTIL")
+    assert ("The 6-installment plan would leave ₹62,912 on 13 Feb, "
+            "₹1,588 below your minimum.") in report
+    assert session.report["recommended_option"]["type"] == "wait"
+    assert session.report["decision"]["affordability_status"] == "affordable_later"
+
+
+def test_named_split_that_is_safe_becomes_the_verdict():
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I split ₹20,000 into 3 payments?")
+    session.handle("")                     # no deadline
+    session.handle("")                     # no split fee
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ SPLIT INTO 3 EQUAL PAYMENTS ─╮"
+    assert "You could also wait until 15 Feb and pay in full at no extra cost." in report
+    chosen = session.report["recommended_option"]
+    assert chosen["type"] == "split" and chosen["count"] == 3
+
+
+def test_named_split_with_an_impossible_window_says_so_and_falls_back():
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I split ₹50,000 in 3 days?")   # deadline parsed in-sentence
+    session.handle("")                     # no split fee
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0].startswith("╭─ WAIT UNTIL")
+    assert ("Splitting into equal payments is not possible: payments must be "
+            "at least 7 days apart.") in report
+    assert session.report["recommended_option"]["type"] == "wait"
+
+
+def test_named_part_now_that_is_safe_becomes_the_verdict():
+    # Half of ₹50,000 exceeds the safe capacity, so the part-now plan uses the
+    # largest safe amount: the method is honored, the amount is downsized.
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I pay half now for a ₹50,000 laptop?")
+    session.handle("")                     # no deadline
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ PAY ₹15,078.52 NOW AND THE REST ON 2026-02-15 ─╮"
+    assert session.report["recommended_option"]["type"] == "partial_then_remainder"
+
+
+def test_named_part_now_that_is_not_needed_says_so_and_falls_back():
+    # Half of ₹10,000 would be safe, but full payment already fits today, so
+    # no part-now plan exists: the report says so and pays in full.
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I pay half now for a ₹10,000 laptop?")
+    session.handle("")                     # no deadline
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ PAY IN FULL TODAY ─╮"
+    assert "Paying part now is not needed: the full amount already fits today." in report
+    assert session.report["recommended_option"]["type"] == "pay_in_full_now"
+
+
+def test_named_full_payment_that_is_unsafe_says_so_and_falls_back():
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I pay ₹50,000 in full?")
+    session.handle("")                     # no deadline
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0].startswith("╭─ WAIT UNTIL")
+    assert ("Paying in full today would leave ₹29,579 on 13 Feb, "
+            "₹34,921 below your minimum.") in report
+    assert session.report["recommended_option"]["type"] == "wait"
+
+
+def test_named_full_payment_that_is_safe_becomes_the_verdict():
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I pay ₹10,000 in full?")
+    session.handle("")                     # no deadline
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ PAY IN FULL TODAY ─╮"
+    # The engine picked the same plan, so there is no alternative note.
+    assert session.report.get("named_method_note") is None
+    assert session.report["recommended_option"]["type"] == "pay_in_full_now"
+
+
+def test_let_verdict_decide_keeps_the_engine_ranking():
+    # Without a named method ("Let Verdict decide") the engine's pick stands:
+    # for user_20's ₹50,000 that is the safest part-now plan, not installments.
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I afford a ₹50,000 laptop?")
+    session.handle("")                     # no deadline
+    session.handle("")                     # Let Verdict decide
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ PAY ₹15,078.52 NOW AND THE REST ON 2026-02-15 ─╮"
+    assert session.report.get("named_method_note") is None
+
+
+def test_installment_followup_honors_the_named_count():
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I afford a ₹50,000 laptop?")
+    session.handle("")                     # no deadline
+    session.handle("")                     # Let Verdict decide -> wait
+    blocks = session.handle("6 installments")
+    assert any(block["text"].startswith("WHAT CHANGED") for block in blocks)
+    text = blocks[-1]["text"]
+    assert text.split("\n", 1)[0] == "╭─ PAY IN 6 INSTALLMENTS ─╮"
+    assert "You could also wait until 15 Feb and pay in full at no extra cost." in text
+
+
+def test_thin_margin_above_the_minimum_is_disclosed():
+    # ₹15,000 in full leaves ₹79.52 of room: under 1% of the ₹64,500 minimum,
+    # so the report says plainly that the plan is tight.
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I pay ₹15,000 in full?")
+    session.handle("")                     # no deadline
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ PAY IN FULL TODAY ─╮"
+    assert "This plan leaves only ₹79 of room above your minimum." in report
+
+
+def test_comfortable_margin_gets_no_thin_margin_line():
+    session = TerminalSession("user_20", "2026-02-07")
+    session.handle("Can I pay ₹10,000 in full?")
+    session.handle("")                     # no deadline
+    report = session.last_blocks[-1]["text"]
+    assert "of room above your minimum" not in report
+
+
+def test_named_method_the_profile_excludes_is_ignored_silently():
+    # user_07 accepts installments only; a named part-now plan must not
+    # change the verdict (the intake statement already covers the exclusion).
+    session = TerminalSession("user_07", "2025-11-04")
+    session.handle("Laptop 12k no deadline pay half now just advise")
+    report = session.last_blocks[-1]["text"]
+    assert report.split("\n", 1)[0] == "╭─ PAY IN 3 INSTALLMENTS ─╮"
+    assert session.report.get("named_method_note") is None

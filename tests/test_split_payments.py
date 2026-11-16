@@ -346,12 +346,14 @@ def test_no_deadline_split_states_the_30_day_window(split_dataset):
 
 
 def test_window_under_seven_days_makes_the_split_impossible(split_dataset):
+    # The named split cannot exist in a window under seven days: the report
+    # says so first, then falls back to the engine's own pick (full today).
     _assistant, session = _session(split_dataset)
     session.handle("Laptop 12k in 3 days")
     session.handle("5")
     blocks = session.handle("")
     report = blocks[-1]["text"]
-    assert report.split("\n", 1)[0].startswith("╭─ NOT RECOMMENDED")
+    assert report.split("\n", 1)[0] == "╭─ PAY IN FULL TODAY ─╮"
     assert "Splitting into equal payments is not possible: payments must be at least 7 days apart." in report
 
 
@@ -395,12 +397,15 @@ def test_make_it_n_payments_recomputes_and_refuses_out_of_range(split_dataset):
 
 
 def test_unsafe_requested_count_is_refused_and_keeps_the_plan(split_dataset):
+    # Every split count is unsafe for 300k, so the report says so first and
+    # falls back to the engine's own pick (wait); a later unsafe count is
+    # refused with the balance math instead of a new report.
     _assistant, session = _session(split_dataset)
     session.handle("Laptop 300k in 14 days")
     session.handle("5")
-    session.handle("")                # nothing safe -> NOT RECOMMENDED
+    session.handle("")
     report = session.last_blocks[-1]["text"]
-    assert report.split("\n", 1)[0].startswith("╭─ NOT RECOMMENDED")
+    assert report.split("\n", 1)[0].startswith("╭─ WAIT UNTIL")
     assert "No equal-payment split up to 3 payments keeps your balance above the minimum." in report
     blocks = session.handle("make it 3 payments")
     assert blocks[0]["text"].startswith("No change: 3 payments would drop the balance to ")

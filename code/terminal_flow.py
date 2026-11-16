@@ -372,6 +372,7 @@ class TerminalSession:
         self.latest_wording = "plain text"
         self.last_blocks = []
         self._installment_count_given = False
+        self._named_method = None
         self._no_change_reason_cached = None
         self._partial_safest_cache = None
         self._split_classes_cache = None
@@ -560,6 +561,145 @@ class TerminalSession:
         row["affordability_status"] = "affordable_with_plan"
         row["recommended_payment_method"] = "partial_payment"
         row["payment_plan"] = format_payment_plan(suggested["dates"])
+
+    def _named_row(self, result, named, wanted_type):
+        """The ranked row for the user's named method, or None when none exists."""
+        rows = [x for x in result.get("ranked_options", []) if x.get("type") == wanted_type]
+        if named == "installments":
+            count = int(self.form.get("installment_count", 3) or 3)
+            return next((x for x in rows if len(x.get("amounts") or {}) == count), None)
+        if named == "split":
+            if self.form.get("split_count"):
+                count = int(self.form["split_count"])
+                return next((x for x in rows if x.get("count") == count), None)
+            return (result.get("split_evaluation") or {}).get("suggested")
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _same_plan(a, b):
+        return a is b or (a.get("type") == b.get("type") and a.get("dates") == b.get("dates"))
+
+    def _override_decision_row(self, result, wanted):
+        """Keep the decision row consistent with a named-method override."""
+        status = {"pay_in_full_now": "affordable_now", "partial_then_remainder": "affordable_with_plan",
+                  "installments": "affordable_with_plan", "split": "affordable_with_plan",
+                  "wait": "affordable_later"}[wanted["type"]]
+        method = {"pay_in_full_now": "full_payment", "partial_then_remainder": "partial_payment",
+                  "installments": "installments", "split": "partial_payment",
+                  "wait": "wait"}[wanted["type"]]
+        row = result.setdefault("decision", {})
+        row["affordability_status"] = status
+        row["recommended_payment_method"] = method
+        row["payment_plan"] = format_payment_plan(wanted["dates"])
+
+    def _restore_decision_row(self, result, engine_decision):
+        """Undo a split's forced not_affordable row after falling back."""
+        row = result.setdefault("decision", {})
+        for key, value in engine_decision.items():
+            if value is None:
+                row.pop(key, None)
+            else:
+                row[key] = value
+
+    def _plain_words(self, option):
+        """The engine's pick in plain words, for the named-method note."""
+        if not option or not option.get("safe"):
+            return None
+        kind = option.get("type")
+        if kind == "wait":
+            return (f"You could also wait until {self._short(max(option['dates']))} "
+                    "and pay in full at no extra cost.")
+        if kind == "pay_in_full_now":
+            return "You could also pay in full today at no extra cost."
+        if kind == "partial_then_remainder":
+            amounts = option.get("amounts") or {}
+            first = next(iter(amounts.values()), None)
+            last = list(amounts)[-1] if amounts else None
+            return (f"You could also pay {self._prose(first)} now and the rest on "
+                    f"{self._short(last)}.")
+        if kind == "installments":
+            return f"You could also pay in {len(option.get('amounts') or {})} installments instead."
+        if kind == "split":
+            return (f"You could also split it into {option.get('count', 2)} equal payments "
+                    f"of {self._prose(option.get('per_payment', 0))} each.")
+        return None
+
+    def _named_refusal_words(self, result, named, wanted):
+        """Why the user's named method was not used, in one plain sentence."""
+        deadline = self.form.get("pay_by_date")
+        subject = {"full": "Paying in full today",
+                   "partial": "The part-now payment",
+                   "installments": f"The {self.form.get('installment_count', 3)}-installment plan",
+                   "split": (f"A {wanted.get('count', 2)}-payment split" if wanted
+                             else "Splitting into equal payments")}[named]
+        if wanted is not None and deadline and wanted.get("meets_deadline") is False:
+            return (f"{subject} would finish on {max(wanted.get('dates') or [])}, "
+                    f"after your {deadline} deadline.")
+        if wanted is not None:
+            minimum = result["situation"]["minimum_balance"]
+            margin = self._margin_words(wanted["lowest_projected_balance"] - minimum)
+            return (f"{subject} would leave {self._prose(wanted['lowest_projected_balance'])} on "
+                    f"{self._short(wanted['lowest_projected_date'])}, {margin}.")
+        if named == "split":
+            split_eval = result.get("split_evaluation") or {}
+            if (split_eval.get("n_max") or 0) < 2:
+                return "Splitting into equal payments is not possible: payments must be at least 7 days apart."
+            return (f"No equal-payment split up to {split_eval.get('n_max')} payments "
+                    "keeps your balance above the minimum.")
+        if named == "installments":
+            count = self.form.get("installment_count", 3)
+            if deadline:
+                return f"A {count}-installment plan cannot finish by {deadline}."
+            return f"A {count}-installment plan is not available for this amount."
+        if named == "partial":
+            situation = result["situation"]
+            room = float(situation["lowest_projected_balance"]) - float(situation["minimum_balance"])
+            if room > 0.005:
+                return "Paying part now is not needed: the full amount already fits today."
+            return "No partial payment is safe to make today for this amount."
+        return "Paying in full today is not safe for this amount."
+
+    def _apply_named_method(self, result, engine_pick, engine_decision):
+        """Honor a payment method the user named in their sentence or answers.
+
+        When the named method is allowed by the profile and safe (and meets the
+        deadline), the verdict becomes that method and the engine's own pick
+        moves to ALTERNATIVES in plain words.  When the named method is unsafe
+        or misses the deadline, the note says so first and the engine's pick
+        stands.  Without a named method the engine's ranking is kept as is.
+        """
+        named = getattr(self, "_named_method", None)
+        type_of = {"full": "pay_in_full_now", "partial": "partial_then_remainder",
+                   "installments": "installments", "split": "split"}
+        method_of = {"full": "full_payment", "partial": "partial_payment",
+                     "split": "partial_payment", "installments": "installments"}
+        if not named or method_of[named] not in self.assistant._profile_allowed_methods():
+            return
+        wanted = self._named_row(result, named, type_of[named])
+        if wanted is not None and wanted.get("safe") and wanted.get("meets_deadline") is not False:
+            if engine_pick is not None and self._same_plan(engine_pick, wanted):
+                return                      # the engine's own pick is that method
+            result["recommended_option"] = wanted
+            self._override_decision_row(result, wanted)
+            note = self._plain_words(engine_pick)
+            if note:
+                result["named_method_note"] = note
+                result["named_method_kind"] = "alternative"
+            return
+        # The named method is unsafe, misses the deadline or is not possible:
+        # say so first, then fall back to the engine's pick.
+        chosen = result.get("recommended_option")
+        if chosen is None and engine_pick is not None and engine_pick.get("safe"):
+            # A failed split forced NOT RECOMMENDED; the engine's own pick,
+            # which it evaluated before the split, still stands.
+            result["recommended_option"] = engine_pick
+            self._restore_decision_row(result, engine_decision)
+            chosen = engine_pick
+        if chosen is None or not chosen.get("safe") or (
+                wanted is not None and self._same_plan(chosen, wanted)):
+            return                          # WHY already explains the refused plan
+        result["named_method_note"] = self._named_refusal_words(result, named, wanted)
+        result["named_method_kind"] = "refusal"
 
     def _history_outflow_average(self):
         """Average monthly debit outflows over the last 3 months of bank history."""
@@ -1194,6 +1334,7 @@ class TerminalSession:
             self._block("text", quick_text)
         self.questions = []
         self._installment_count_given = False
+        self._named_method = None
         if not self._parse_deadline(line):
             self.questions.append("deadline")
         # One method question replaces the old partial/installments yes/no pair.
@@ -1202,6 +1343,7 @@ class TerminalSession:
         inst_named = bool(count) or bool(not declined_inst and re.search(r"\b(?:installments?|instalments?)\b|\bin\s+parts\b", lowered))
         partial = re.search(r"pay half now|partial payment|part now", lowered)
         full_named = re.search(r"\b(?:no partial|pay in full|full payment only|in full)\b", lowered)
+        split_named = re.search(r"\bsplit\b", lowered)
         fee_match = re.search(r"(\d+(?:\.\d+)?)\s*%", lowered)
         fee_invalid = bool(fee_match and not (0 <= float(fee_match.group(1)) <= 30))
         self._fee_invalid = fee_invalid
@@ -1224,6 +1366,7 @@ class TerminalSession:
             self.form.update(allow_installments=True, installment_count=int(count.group(1)),
                              allow_partial=False)
             self._installment_count_given = True
+            self._named_method = "installments"
             cap = self.assistant._max_installment_months()
             if cap and self.form["installment_count"] > cap:
                 self.form["installment_count"] = cap
@@ -1232,12 +1375,24 @@ class TerminalSession:
                 self.questions.append("fee")
         elif inst_named:
             self.form.update(allow_installments=True, allow_partial=False)
+            self._named_method = "installments"
             self.questions.append("installments")
             if fee_invalid:
                 self.questions.append("fee")
+        elif split_named and "partial_payment" in self.assistant._profile_allowed_methods():
+            # The sentence names a split, optionally with its payment count.
+            self.form.update(allow_split=True, installments_declined=True,
+                             allow_partial=False, allow_installments=False)
+            self._named_method = "split"
+            split_count = (re.search(r"\bsplit\s+(?:it\s+)?(?:into|in)\s+(\d+)\b", lowered)
+                           or re.search(r"\bsplit\b.*?\b(\d+)\s+payments?\b", lowered))
+            if split_count:
+                self.form["split_count"] = int(split_count.group(1))
+            self.questions.append("split_fee")
         elif partial:
             self.form["allow_partial"] = True
             self.form["allow_installments"] = False
+            self._named_method = "partial"
             if "pay half now" in lowered:
                 self.form["partial_amount"] = self.form["amount"] * 0.5
             else:
@@ -1248,6 +1403,7 @@ class TerminalSession:
                 self.form["installments_declined"] = True
             if full_named:
                 self.form["partial_declined"] = True
+                self._named_method = "full"
         elif not just_advise:
             pay_methods = self._pay_methods()
             if len(pay_methods) > 1:
@@ -1379,6 +1535,9 @@ class TerminalSession:
             parts.append("installments")
         elif self.form.get("allow_partial"):
             parts.append("half now" if self.form.get("partial_amount") else "partial payment")
+        elif self.form.get("allow_split") and "split" not in item:
+            count = self.form.get("split_count")
+            parts.append(f"split into {count} equal payments" if count else "split into equal payments")
         if self.form.get("pay_by_date"):
             parts.append(f"pay by {self.form['pay_by_date']}")
         elif re.search(r"\b(?:no deadline|no due date|just advise)\b", lowered):
@@ -1470,6 +1629,7 @@ class TerminalSession:
                     # full today. The kept deadline stays untouched.
                     self.form["allow_installments"] = False
                     self.form["installments_declined"] = True
+                    self._named_method = "full"
                 else:
                     self.form["pay_by_date"] = dt.date.fromisoformat(value).isoformat()
             elif value in {"", "1"}:
@@ -1501,6 +1661,7 @@ class TerminalSession:
             self.form["pay_by_date"] = parsed.isoformat() if parsed else None
         elif key == "method":
             pick = method_choices.get(value, "decide")
+            self._named_method = None if pick == "decide" else pick
             if pick == "full":
                 self.form["allow_partial"] = False
                 self.form["partial_declined"] = True
@@ -1536,6 +1697,7 @@ class TerminalSession:
             self.form["allow_partial"] = False
             self.form["installment_count"] = installment_choices.get(value, installment_choices["1"])
             self._installment_count_given = True
+            self._named_method = "installments"
         elif key == "partial_amount":
             applied = min(float(partial_now), float(self.form["amount"]))
             safest = self._safest_partial_amount()
@@ -1544,12 +1706,14 @@ class TerminalSession:
                 self._block("text", f"Only {self._fmt(safest)} is safe to pay today; using it.")
             self.form["allow_partial"] = True
             self.form["partial_amount"] = applied
+            self._named_method = "partial"
         elif key == "split_offer":
             if value in {"", "1"}:
                 self.form["allow_split"] = True
                 self.form["installments_declined"] = True
                 self.form["allow_partial"] = False
                 self.form["allow_installments"] = False
+                self._named_method = "split"
                 self.questions.insert(self.question_index + 1, "split_fee")
             else:
                 # No split: keep the deadline miss honest in the report.
@@ -1606,12 +1770,25 @@ class TerminalSession:
                     with fp.tool_call("advise", input={"user_id": self.user_id, "amount": self.form["amount"]}) as tool:
                         result = self.assistant.advise(self.form)
                         tool.output = result
+                    # The engine's own recommendation, captured before the split
+                    # evaluation rewrites it: a named method that is not safe
+                    # falls back to this pick, with this decision row.
+                    engine_pick = result.get("recommended_option")
+                    engine_row = result.get("decision", {})
+                    engine_decision = {"affordability_status": engine_row.get("affordability_status"),
+                                       "recommended_payment_method": engine_row.get("recommended_payment_method"),
+                                       "payment_plan": engine_row.get("payment_plan")}
                     if self.form.get("allow_split"):
                         with fp.tool_call("evaluate_split", input={"user_id": self.user_id}) as split_tool:
                             split_eval = self._evaluate_split()
                             split_tool.output = {"candidates": [row["count"] for row in split_eval["rows"]],
                                                  "suggested": (split_eval["suggested"] or {}).get("count")}
                         self._apply_split(result, split_eval)
+                    with fp.tool_call("apply_named_method", input={"user_id": self.user_id}) as named_tool:
+                        self._apply_named_method(result, engine_pick, engine_decision)
+                        named_tool.output = {"named_method": self._named_method,
+                                             "recommended": (result.get("recommended_option") or {}).get("type"),
+                                             "note": result.get("named_method_note")}
             self.report = result
             self.latest_result = result
             self.latest_wording = "plain text"
@@ -2280,6 +2457,8 @@ class TerminalSession:
         chosen = result.get("recommended_option")
         if chosen is not None and not chosen.get("safe", False):
             chosen = None
+        note = result.get("named_method_note")
+        alt_note = bool(note) and result.get("named_method_kind") == "alternative"
         not_affordable = str(result.get("decision", {}).get("affordability_status")) == "not_affordable"
         unmet_deadline = self._unmet_deadline(result)
         if unmet_deadline:
@@ -2299,6 +2478,12 @@ class TerminalSession:
         levels = "▁▂▃▄▅▆▇█"
         spark = "" if not vals else "".join(levels[round((v-min(vals))/(max(vals)-min(vals))*7)] if max(vals) != min(vals) else "▄" for v in vals)
         minimum = situation["minimum_balance"]
+        # A plan that squeaks above the minimum gets a plain thin-margin line.
+        margin_note = None
+        if chosen is not None:
+            room = float(chosen["lowest_projected_balance"]) - float(minimum)
+            if 0.0 < room < 0.01 * float(minimum):
+                margin_note = f"This plan leaves only {self._prose(room)} of room above your minimum."
         rows = ["OPTION                 WHEN                 TOTAL COST       LOWEST BALANCE   MEETS DEADLINE   SAFE"]
         for option in options:
             safe_mark = "✓" if option.get("safe") else "✗"
@@ -2328,6 +2513,10 @@ class TerminalSession:
         spending_changes = result["decision"].get("spending_changes_needed", "none")
         shortest_plan = installment_completion_date(self.as_of_date, min(self.installment_counts))
         alts = []
+        # The named-method note leads ALTERNATIVES so every fallback below
+        # treats the section as already explained.
+        if note:
+            alts.append(note)
 
         if unmet_deadline:
             blocked = self._blocked_but_affordable_lines(result)
@@ -2341,9 +2530,9 @@ class TerminalSession:
             if other_safe_names:
                 alts.append(f"Safe alternative options: {', '.join(other_safe_names)}.")
         elif verdict.startswith("PAY IN FULL TODAY"):
-            if other_safe_names:
+            if other_safe_names and not alt_note:
                 alts.append(f"Other safe payment structures: {', '.join(other_safe_names)}.")
-            else:
+            elif not other_safe_names:
                 alts.append("Paying in full today is your most direct and cost-effective safe option.")
             buffer = situation["lowest_projected_balance"] - minimum
             if buffer > 0.005:
@@ -2386,14 +2575,14 @@ class TerminalSession:
         elif "WAIT" in verdict:
             if safe_today > 0:
                 alts.append(f"Amount safe to pay today: {self._money(safe_today, currency)} (partial payment).")
-            if other_safe_names:
+            if other_safe_names and not alt_note:
                 alts.append(f"Other safe options: {', '.join(other_safe_names)}.")
             if spending_changes != "none":
                 alts.append(f"Spending changes to enable paying sooner: {spending_changes}.")
             if not alts:
                 alts.append(f"Waiting until {earliest} avoids dropping below your required minimum balance.")
         elif verdict.startswith("SPLIT INTO"):
-            if other_safe_names:
+            if other_safe_names and not alt_note:
                 alts.append(f"Other safe options: {', '.join(other_safe_names)}.")
             full_now = next((x for x in options if x.get("safe") and x["type"] == "pay_in_full_now"), None)
             if full_now and "full_payment" in self.assistant._profile_allowed_methods():
@@ -2401,10 +2590,10 @@ class TerminalSession:
             if not alts:
                 alts.append("The split spreads the payment so your balance never dips below the minimum.")
         else:
-            if ("full_payment" in self.assistant._profile_allowed_methods()
+            if not alt_note and ("full_payment" in self.assistant._profile_allowed_methods()
                     and earliest and earliest > self.as_of_date):
                 alts.append(f"Full payment alternative: wait until {earliest} to pay in full and avoid fees.")
-            if other_safe_names:
+            if other_safe_names and not alt_note:
                 alts.append(f"Other safe options: {', '.join(other_safe_names)}.")
             if spending_changes != "none":
                 alts.append(f"Spending changes that would free cash: {spending_changes}.")
@@ -2419,6 +2608,9 @@ class TerminalSession:
                     alts.append("Earlier options exist but aren't among the payment methods you accept.")
                 else:
                     alts.append("The selected plan is the earliest way to proceed safely without overdraft risk.")
+
+        if margin_note:
+            alts.insert(1 if note else 0, margin_note)
 
         if unmet_deadline:
             steps = [
@@ -2888,12 +3080,15 @@ class TerminalSession:
         if self.form.get("allow_split"):
             outcome = self._split_amendment(low)
             if outcome is not None:
+                if outcome != "nochange":
+                    self._named_method = "split"
                 return outcome
         if "half" in low or re.search(r"\bpay\s+\d+(?:\.\d+)?\s*%\s+now\b", low) or re.search(r"\bpay\s+[\d,.]+\s*(?:k|thousand)?\s+now\b", low):
             self.form["allow_partial"] = True
             self.form["allow_installments"] = False
             self.form.pop("allow_split", None)
             self.form.pop("split_count", None)
+            self._named_method = "partial"
             percent = re.search(r"\bpay\s+(\d+(?:\.\d+)?)\s*%\s+now\b", low)
             explicit = re.search(r"\bpay\s+([\d,.]+)\s*(k|thousand)?\s+now\b", low)
             if percent:
@@ -2917,6 +3112,7 @@ class TerminalSession:
             self.form.pop("installments_declined", None)
             self.form.pop("allow_split", None)
             self.form.pop("split_count", None)
+            self._named_method = "installments"
             self._installment_count_given = True
             self._installment_count_only = False
             cap = self.assistant._max_installment_months()

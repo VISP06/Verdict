@@ -8,4 +8,5 @@ __pycache__/
 *.pyc
 *:Zone.Identifier
 /output_evidence.jsonl
+/artifacts/evaluation/output_evidence.jsonl
 .env

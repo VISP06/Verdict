@@ -17,7 +17,7 @@ load_dotenv()
 fp.configure(environment=os.getenv("FAILPROOF_ENV", "dev"))
 
 DATASET_DIR = "dataset"
-OUTPUT_FILE = "output.csv"
+OUTPUT_FILE = os.path.join("artifacts", "evaluation", "output.csv")
 
 def format_payment_plan(plan_dict):
     if not plan_dict:

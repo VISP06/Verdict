@@ -1,13 +1,13 @@
 # Buy or Wait? — project handoff
 
 Read this first. It is the single source of context for continuing the project in a new session.
-Spec of the original task: `ps_orchestrate.md` (HackerRank Orchestrate "Buy or Wait?" problem statement). The README is current but shorter than this file.
+Spec of the original task: `docs/reference/original_challenge.md` (HackerRank Orchestrate "Buy or Wait?" problem statement). The README is current but shorter than this file.
 
 ## 1. What this is and why it exists
 
 A financial decision agent: given a user's money data and a planned payment ("Can I afford this laptop?"), it decides whether to **pay in full, pay partially, use installments, wait, or not buy**, based on balance, recurring bills, pending items, essential spending, *confirmed* income, payment options, and evidence in messages and receipt images.
 
-The author built it first as practice for HackerRank Orchestrate, then used it to learn **Failproof AI** (observability for agents; org `Hacktoberfest_Luma`, app.befailproof.ai) and to add RAG-style evidence (retrieval over messages) plus a conversational "glacier terminal" front end. Design rule throughout: **the LLM never does money math.** Forecasting, ranking and safety checks are deterministic Python; models only classify income reliability, reword explanations (validated), and (optionally) interpret free text.
+The author built it first as practice for HackerRank Orchestrate, then used it to learn **Failproof AI** (observability for agents; org `Hacktoberfest_Luma`, app.befailproof.ai) and to add RAG-style evidence (retrieval over messages) plus a conversational "Verdict terminal" front end. Design rule throughout: **the LLM never does money math.** Forecasting, ranking and safety checks are deterministic Python; models only classify income reliability, reword explanations (validated), and (optionally) interpret free text.
 
 ## 2. Architecture (files in `code/`)
 
@@ -20,9 +20,7 @@ The author built it first as practice for HackerRank Orchestrate, then used it t
 | `retrieval.py` | local retrieval over `messages.csv` (fastembed if available, else TF-IDF), filtered by user and date |
 | `assistant.py` | `Assistant.situation()`, `advise(form)` (ad hoc advice: all options ranked, safety-first), LLM interpretation paths (not used by the terminal) |
 | `terminal_flow.py` | `TerminalSession`: deterministic conversation state machine (intake questions, report, what-if follow-ups, commands) — no Streamlit import |
-| `request_parser.py` | cuts one sentence into item, amount, deadline phrase, payment style, intents (balance / max affordable / upcoming / situation) |
-| `insights.py` | model-free helpers: safe-to-spend today, capacity from a date, next income, upcoming bills, cushion label |
-| `terminal.py`, `../app.py` | real CLI and the Streamlit "glacier terminal" (dark, JetBrains Mono; MCQ-style clickable options) |
+| `terminal.py`, `../app.py` | CLI and Streamlit interfaces for Verdict |
 | `observability.py` | Failproof SDK wrapper; sessions `req-<request>-<run>`, `income-…`, `explain-batch-N`, `chat-<run>`; env from `FAILPROOF_ENV` (`dev`, `eval`, `test`) |
 | `text_parser.py`, `vision_parser.py` | perception (message cancellations, receipt amounts → `patched_financial_events.csv`); the engine uses the patched events file when present |
 
@@ -37,8 +35,8 @@ The author built it first as practice for HackerRank Orchestrate, then used it t
 ## 4. Current results and invariants
 
 Evaluator on the 25 samples: **status 76 %, method 88 %, payment plan 80 %, safe amount (exact) 8 %, earliest date 68 %** (session start: 36 / 44 / 24 / 16 / 36). The exact safe-amount rule is unknown; most amounts are within 5–15 %.
-Real run: `python code/main.py --requests dataset/requests.csv --output output.csv` → 250 rows, `validate_output.py` reports no violations; output has exactly the 8 spec columns (evidence goes to gitignored `output_evidence.jsonl`).
-**Do not break:** evaluate.py scores, `output.csv` content, the advisor oracle test (pay-in-full flag / lowest balance equal the engine's), HTML escaping of user text. Tests (≈180) use fake clients and make **no real model calls**.
+Real run: `python code/main.py --requests dataset/requests.csv --output artifacts/evaluation/output.csv` → 250 rows, `validate_output.py` reports no violations; output has exactly the 8 spec columns (evidence goes to gitignored `output_evidence.jsonl`).
+**Do not break:** evaluate.py scores, the checked-in batch output, the advisor oracle test (pay-in-full flag / lowest balance equal the engine's), HTML escaping of user text. The current test suite uses fake clients for model-dependent paths and does not make real model calls.
 
 ## 5. How to run
 
@@ -46,8 +44,8 @@ Real run: `python code/main.py --requests dataset/requests.csv --output output.c
 source venv/bin/activate && pip install -r requirements.txt
 python -m pytest tests -q                       # ~3 min
 python evaluation/evaluate.py                   # ~15 s, prints coverage line and 5 scores
-python code/main.py --requests dataset/requests.csv --output output.csv
-python evaluation/validate_output.py output.csv dataset/requests.csv
+python code/main.py --requests dataset/requests.csv --output artifacts/evaluation/output.csv
+python evaluation/validate_output.py artifacts/evaluation/output.csv dataset/requests.csv
 python -u code/main.py --fill-income-cache --requests dataset/requests.csv   # LLM, needs quota; cache-resumable
 streamlit run app.py                            # browser terminal (restart the server after every pull!)
 python code/terminal.py --user user_07          # same engine in a shell
@@ -61,7 +59,7 @@ python code/terminal.py --user user_07          # same engine in a shell
 - Default as-of date for a user = their **request date** (balance snapshot date). Using the last event's day double-counts that day's events.
 - Terminal UX: guided questions with defaults, shown as clickable MCQ options (no numbers); one sentence with everything goes straight to the report; unrecognized text never reprints an old report.
 - Currency: amounts without a symbol are in the account currency; a foreign currency without a direct dated rate asks for the home-currency amount (no guessed cross-rates).
-- UI palette: dark "glacier" (`#08141F`, frost `#D8F3FF`, cyan `#5CE1E6`, mint `#7CF5C0`, amber `#FFD479`, coral `#FF7A90`), font JetBrains Mono. Avoid the cream/teal/vermilion palette (too similar to another project of the author).
+- UI palette: dark terminal, the "verdict" tokens — bg `#061019`, panels `#0C2131` / `#10293C` / `#0A1D2B`, borders `#1E4E67` / `#2A5F79` / `#3A7E99`, ink `#DCEFFB`, dim `#9CBFD2`, faint `#7FA6BD`, accent cyan `#5CE1E6`, ice `#8CC8FF`, safe mint `#7CF5C0`, caution amber `#FFD479`, unsafe coral `#FF7A90`; font JetBrains Mono. Motion: 150-260 ms transitions, entry animation only for newly appended blocks, chart draw-on; everything gated on `prefers-reduced-motion`. Avoid the cream/teal/vermilion palette (too similar to another project of the author).
 - `options[*].dates` / `amounts` are dicts keyed by ISO date. `situation["monthly_income_total"]` is actually the **90-day total** of counted income (misnamed; text was corrected, key was not).
 
 ## 6.1 Task 3 interactive-flow changes
@@ -96,5 +94,5 @@ income at the default, and the zero-room wording.
 git log --oneline | head -5
 python -m pytest tests -q | tail -2
 python evaluation/evaluate.py | head -8          # expect 76/88/80/8/68
-python evaluation/validate_output.py output.csv dataset/requests.csv
+python evaluation/validate_output.py artifacts/evaluation/output.csv dataset/requests.csv
 ```

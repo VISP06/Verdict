@@ -10,15 +10,14 @@ The defining architectural principle of this system is simple: **the LLM never d
 
 ## Demo
 
-The project includes an interactive conversational interface dubbed the **Glacier Terminal**, available both as a modern web app (via Streamlit) and a command-line interface. It features a dark terminal palette, JetBrains Mono typography, clickable MCQ-style response options, ASCII balance sparklines, and scrollable comparison tables.
+The project includes an interactive conversational interface dubbed the **Verdict Terminal**, available both as a modern web app (via Streamlit) and a command-line interface. It features a dark terminal palette, JetBrains Mono typography, clickable MCQ-style response options, ASCII balance sparklines, and scrollable comparison tables.
 
 <!-- Screenshot placeholder -->
-![Glacier Terminal Interface](docs/glacier_terminal_screenshot.png)
-*Figure 1: Glacier Terminal web interface displaying 90-day balance trajectories and ranked payment options.*
+![Verdict Terminal Interface](docs/verdict_terminal_screenshot.png)
+*Figure 1: Verdict Terminal welcome screen and interactive decision flow.*
 
-<!-- GIF walkthrough placeholder -->
-![Glacier Terminal Interactive Session](docs/glacier_terminal_walkthrough.gif)
-*Figure 2: Interactive session showing intake prompts, instant quick answers, and what-if parameter overrides.*
+![Situation Snapshot](docs/verdict_situation_screenshot.png)
+*Figure 2: A formatted account situation snapshot in the conversation.*
 
 ---
 
@@ -30,7 +29,7 @@ The project includes an interactive conversational interface dubbed the **Glacie
 - **Multiple Payment Pathways:** Automatically models and compares 5 distinct paths: paying in full immediately, partial split schedules (paying what is safe today and the rest later), equal installments, waiting for a safe future date, or declining the purchase.
 - **Spending Change Recommendations:** Identifies flexible recurring expenses (subscriptions, discretionary memberships) that can be safely reduced or stopped to make an otherwise unaffordable purchase viable.
 - **Multi-Currency Support:** Handles accounts in Indian Rupee (INR), Euro (EUR), US Dollar (USD), South African Rand (ZAR), and Indonesian Rupiah (IDR) using direct dated exchange rates.
-- **Glacier Conversational UI:** Offers quick-answer summaries, guided multi-choice questions (MCQs), inline deadline calendar pickers, and exportable decision reports.
+- **Verdict Conversational UI:** Offers quick-answer summaries, guided multi-choice questions (MCQs), inline deadline calendar pickers, and exportable decision reports.
 - **Full Agent Observability:** Native integration with the [Failproof AI SDK](https://befailproof.ai) to capture execution sessions, trace tool calls, and monitor agent errors across development and evaluation environments.
 
 ---
@@ -68,7 +67,7 @@ flowchart TD
 
     subgraph Presentation & Tracing
         EXP[explain.py / explain_llm.py<br/>Evidence-grounded rationale]
-        UI[app.py & terminal.py<br/>Glacier UI & CLI state machine]
+        UI[app.py & terminal.py<br/>Verdict UI & CLI state machine]
         FP[Failproof AI SDK<br/>Session & tool call tracing]
     end
 
@@ -136,7 +135,7 @@ cp .env.example .env
 > [!NOTE]
 > All core forecasting, terminal sessions, tests, and accuracy evaluations run entirely offline using pre-cached income classifications. Model API keys (such as `GEMINI_API_KEY`) are only required if you choose to explicitly re-run receipt vision extraction, re-classify income from scratch, or enable LLM explanation polishing.
 
-### 3. Launch the Glacier Browser Terminal
+### 3. Launch the Verdict Browser Terminal
 
 Start the interactive Streamlit terminal:
 
@@ -159,8 +158,8 @@ python code/terminal.py --user user_20
 To generate predictions for all 250 requests in `dataset/requests.csv`:
 
 ```bash
-python code/main.py --requests dataset/requests.csv --output output.csv
-python evaluation/validate_output.py output.csv dataset/requests.csv
+python code/main.py --requests dataset/requests.csv --output artifacts/evaluation/output.csv
+python evaluation/validate_output.py artifacts/evaluation/output.csv dataset/requests.csv
 ```
 
 ---
@@ -348,7 +347,7 @@ The scoring script checks for an exact dollar-for-dollar match (`abs_tol=0.01`).
 2. **Income Reliability as the Decisive Factor:** In experimental benchmarks, income classification accuracy was the single highest predictor of plan correctness. Projecting freelance or one-off income as regular monthly cash flow produces dangerous overdraft recommendations.
 3. **Safety-First Recommendation Gate:** An option is never recommended merely because it is cheap or matches user preferences. If an option breaches the user's minimum balance cushion at any point during the 90 days, it is declared unsafe.
 4. **Request-Date Anchoring:** The evaluation as-of date defaults to the date of the request (the balance snapshot date). Anchoring to the newest transaction date instead would double-count events that took place on the snapshot date.
-5. **Deterministic State Machine:** The Glacier conversational flow (`terminal_flow.py`) is completely independent of Streamlit and model execution. It runs predictably in headless terminal environments and handles interruptions or missing inputs gracefully.
+5. **Deterministic State Machine:** The Verdict conversational flow (`terminal_flow.py`) is completely independent of Streamlit and model execution. It runs predictably in headless terminal environments and handles interruptions or missing inputs gracefully.
 6. **Observability via Failproof AI:** Every request, classification batch, and explanation attempt is recorded in distinct Failproof AI sessions (`req-...`, `income-...`, `chat-...`) to make debugging agent reasoning straightforward.
 
 ---
@@ -377,48 +376,20 @@ The scoring script checks for an exact dollar-for-dollar match (`abs_tol=0.01`).
 
 ```text
 orchestrate_agent/
-├── app.py                         # Streamlit "Glacier" web terminal
-├── requirements.txt               # Project dependencies
+├── app.py                         # Streamlit presentation layer
+├── requirements.txt               # Runtime and test dependencies
 ├── .env.example                   # Environment configuration template
-├── README.md                      # Project documentation
-├── HANDOFF.md                     # Detailed developer context & notes
-├── ps_orchestrate.md              # Original HackerRank challenge problem spec
-├── code/
-│   ├── main.py                    # Batch pipeline & candidate plan ranking
-│   ├── financial_engine.py        # Financial engine & transaction cache
-│   ├── forecast.py                # 90-day balance projection & recurring series
-│   ├── income_classifier.py       # LLM income reliability classifier
-│   ├── assistant.py               # Assistant interface & situation builder
-│   ├── terminal_flow.py           # Deterministic conversation state machine
-│   ├── terminal.py                # Command-line interface wrapper
-│   ├── explain.py                 # Deterministic explanation generator
-│   ├── explain_llm.py             # Optional LLM explanation refiner
-│   ├── retrieval.py               # Message search (FastEmbed / TF-IDF)
-│   ├── observability.py           # Failproof AI tracing integration
-│   ├── text_parser.py             # Message cancellation parser
-│   ├── vision_parser.py           # Multimodal receipt amount parser
-│   ├── money.py                   # Currency formatting utilities
-│   ├── plan_dates.py              # Installment & date helpers
-│   └── loan_reference.json        # Benchmark loan rates (illustrative INR)
-├── dataset/
-│   ├── requests.csv               # 250 test evaluation requests
-│   ├── sample_requests.csv        # 25 ground-truth evaluation samples
-│   ├── financial_profiles.csv     # User balances, reserves, and preferences
-│   ├── financial_events.csv       # Historical & pending banking events
-│   ├── patched_financial_events.csv # Events with receipt amounts filled
-│   ├── request_payment_options.csv# Available installment options
-│   ├── exchange_rates.csv         # Direct foreign exchange rates
-│   ├── messages.csv               # User communications & employer notes
-│   ├── images.csv                 # Image metadata links
-│   ├── income_classes.csv         # Cached income reliability classes
-│   └── media/images/              # Scanned receipt image files
-├── evaluation/
-│   ├── evaluate.py                # Scoring script for ground-truth samples
-│   ├── validate_output.py         # Schema and invariant validator for output.csv
-│   ├── eval_retrieval.py          # Message retrieval evaluation
-│   ├── compare_income_caches.py   # Cache comparison utility
-│   └── make_usage_report.py       # Token usage & cost report generator
-└── tests/                         # 300+ deterministic unit and safety tests
+├── README.md                      # Project guide and setup
+├── HANDOFF.md                     # Project-specific continuation notes
+├── code/                          # Core engine, assistant, CLI, parsing and retrieval
+├── dataset/                       # Input data, cached classifications and media
+├── evaluation/                    # Scoring, validation and analysis utilities
+├── scripts/data/                  # Dataset inspection and validation helpers
+├── artifacts/evaluation/          # Generated batch output (not source data)
+├── docs/
+│   ├── architecture/              # System boundaries, flow, trade-offs and gaps
+│   └── reference/                 # Original challenge specification
+└── tests/                         # Automated behavior and safety tests
 ```
 
 ---

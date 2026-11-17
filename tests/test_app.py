@@ -24,10 +24,10 @@ def test_stale_session_state_is_rebuilt(monkeypatch):
     for key in ("OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
-    at.session_state["terminal_session_glacier-terminal-v4"] = object()
+    at.session_state["terminal_session_verdict-terminal-v5"] = object()
     at.run()
     assert not at.exception
-    assert isinstance(at.session_state["terminal_session_glacier-terminal-v4"].__class__.__name__, str)
+    assert isinstance(at.session_state["terminal_session_verdict-terminal-v5"].__class__.__name__, str)
 
 
 def test_welcome_examples_and_first_chip_starts_intake(monkeypatch):
@@ -35,12 +35,28 @@ def test_welcome_examples_and_first_chip_starts_intake(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
     labels = [button.label for button in at.button]
+    md = "\n".join(x.value for x in at.markdown)
+    assert "See how a purchase fits your next 90 days." in md
     assert "Can I afford a laptop that costs ₹12k?" in labels
     assert "Can I pay ₹50,000 in 6 installments?" in labels
-    assert "/situation" in labels
+    assert "Show my current situation" in labels
     at.button[0].click().run()
     assert not at.exception
     assert "When do you need to pay?" in "\n".join(x.value for x in at.markdown)
+
+
+def test_situation_example_renders_a_structured_snapshot(monkeypatch):
+    _offline(monkeypatch)
+    at = AppTest.from_file(os.path.join(ROOT, "app.py"), default_timeout=45).run()
+    next(button for button in at.button if button.label == "Show my current situation").click().run()
+    assert not at.exception
+    markdown = "\n".join(item.value for item in at.markdown)
+    assert 'class="situation-card"' in markdown
+    assert "ACCOUNT SNAPSHOT" in markdown
+    assert "lowest projected balance:" not in markdown
+    assert "pending items: {" not in markdown
+    assert "Show my current situation" in markdown
+    assert "Account currency:" not in markdown
 
 
 def test_finished_report_status_and_user_text_are_safe(monkeypatch):
@@ -198,7 +214,7 @@ def test_user_selectbox_switches_account_resets_and_defaults_as_of(monkeypatch):
     assert "Currency INR · Balance ₹2,18,945.56 · Minimum ₹93,000.00 · Accepts: installments (up to 12)" in md
     # An intake in progress is thrown away by the switch.
     at.chat_input[0].set_value("Laptop costs 12k").run()
-    session_key = "terminal_session_glacier-terminal-v4"
+    session_key = "terminal_session_verdict-terminal-v5"
     assert at.session_state[session_key].phase == "intake"
     at.selectbox[0].set_value("user_20").run()
     assert not at.exception

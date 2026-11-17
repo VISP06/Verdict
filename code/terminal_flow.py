@@ -26,7 +26,7 @@ _AMOUNT_RE = re.compile(
     r"\d{1,3}(?:,\d{2})+,\d{3}(?:\.\d+)?|\d{1,3}(?:,\d{3})+(?:\.\d+)?|"
     r"\d{1,3}(?: \d{3})+|\d+(?:\.\d+)?)(?![\d,])", re.I
 )
-BANNER = ("Glacier checks whether a payment fits your next 90 days: your balance, income, bills and pending items, "
+BANNER = ("Verdict checks whether a payment fits your next 90 days: your balance, income, bills and pending items, "
           "and tells you whether to pay now, split it, or wait.")
 
 # Short method names in profile order, used by the account picker, the picker
@@ -2797,14 +2797,22 @@ class TerminalSession:
         balances = result.get("evidence", {}).get("balances", {})
         values = list(balances.values())
         dates = list(balances)
+        chosen = result.get("recommended_option")
         options = []
         for item in result.get("ranked_options", []):
             low = item.get("lowest_projected_balance")
+            # The recommended plan is flagged for the UI so its row can be marked
+            # as the chosen one.  Identity holds because both come from the same
+            # result dict; type + cost is the fallback when it does not.
+            recommended = item is chosen or (
+                chosen is not None
+                and str(item.get("type")) == str(chosen.get("type"))
+                and round(float(item.get("total_cost") or 0), 2) == round(float(chosen.get("total_cost") or 0), 2))
             options.append({"name": item.get("label") or item.get("type", "").replace("_", " "), "when": ", ".join(item.get("dates", [])),
                             "cost": self._money(item.get("total_cost", 0), self.form["currency"]),
-                            "lowest": self._money(low, self.form["currency"]),
+                            "lowest": self._money(low, self.form["currency"]), "lowest_value": float(low or 0),
                             "meets_deadline": "n/a" if item.get("meets_deadline") is None else ("yes" if item.get("meets_deadline") else "no"),
-                            "safe": bool(item.get("safe")),
+                            "safe": bool(item.get("safe")), "recommended": recommended,
                             "note": "" if item.get("safe") else f"Unsafe: drops to {self._money(low, self.form['currency'])} on {item.get('lowest_projected_date')}"})
         loan_parts = rendered.split("\n\nLOAN OPTION (illustrative)\n", 1)
         rendered_without_loan = loan_parts[0]
@@ -2942,11 +2950,28 @@ class TerminalSession:
             outflows = s.get("committed_outflows_next_30_days", s.get("outflows_next_30_days", s.get("outflows_next_30", 0)))
             outflows90 = s.get("committed_outflows_next_90_days", s.get("outflows_next_90_days", s.get("outflows_next_90", 0)))
             pending = s.get("pending_items", s.get("pending_items_considered_or_ignored", {}))
-            self._block("text", (f"Balance: {fmt_money(s['current_balance'],c)}; minimum: {fmt_money(s['minimum_balance'],c)}; "
-                                  f"lowest projected balance: {fmt_money(s['lowest_projected_balance'],c)} on {s.get('lowest_projected_date', 'n/a')}; "
-                                  f"income counted: {fmt_money(s.get('monthly_income_total', 0),c)}; "
-                                  f"outflows next 30 days: {fmt_money(outflows,c)}; next 90 days: {fmt_money(outflows90,c)}; "
-                                  f"pending items: {pending}; as of {self.as_of_date}."))
+            considered = pending.get("considered", []) if isinstance(pending, dict) else []
+            ignored = pending.get("ignored", []) if isinstance(pending, dict) else []
+            text = (f"Balance: {fmt_money(s['current_balance'],c)}; minimum: {fmt_money(s['minimum_balance'],c)}; "
+                    f"lowest projected balance: {fmt_money(s['lowest_projected_balance'],c)} on {s.get('lowest_projected_date', 'n/a')}; "
+                    f"income counted: {fmt_money(s.get('monthly_income_total', 0),c)}; "
+                    f"outflows next 30 days: {fmt_money(outflows,c)}; next 90 days: {fmt_money(outflows90,c)}; "
+                    f"pending items: {pending}; as of {self.as_of_date}.")
+            self._block("text", text, data={
+                "view": "situation",
+                "currency": str(c),
+                "as_of_date": self.as_of_date,
+                "current_balance": s.get("current_balance", 0),
+                "minimum_balance": s.get("minimum_balance", 0),
+                "lowest_projected_balance": s.get("lowest_projected_balance", 0),
+                "lowest_projected_date": s.get("lowest_projected_date", "n/a"),
+                "monthly_income_total": s.get("monthly_income_total", 0),
+                "monthly_income_counted": s.get("monthly_income_counted", []),
+                "outflows_next_30_days": outflows,
+                "outflows_next_90_days": outflows90,
+                "pending_considered_count": len(considered),
+                "pending_ignored_count": len(ignored),
+            })
         elif command == "/reset":
             self.phase = "ready"; self.form = {}; self.questions = []; self.report = None
             self._conversion_note = None
